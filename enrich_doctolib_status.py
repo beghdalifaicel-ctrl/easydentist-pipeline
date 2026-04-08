@@ -134,7 +134,9 @@ async def check_batch_http(urls: list[tuple[int, str]], concurrency: int = 3) ->
     semaphore = asyncio.Semaphore(concurrency)
     results = []
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    proxy_url = get_proxy_url()
+    log.info(f"Proxy: {'...{proxy_url[-30:]}' if proxy_url else 'AUCUN (direct)'}")
+    async with httpx.AsyncClient(timeout=20.0, proxy=proxy_url) as client:
 
         async def check_one(row_idx: int, url: str):
             async with semaphore:
