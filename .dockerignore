@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.log
+*.json
+!railway.json
+!package.json
+*.csv
+client_secret*.json
+.git/
+.gitignore
+README.md
+enrich.log

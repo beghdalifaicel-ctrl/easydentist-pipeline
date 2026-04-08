@@ -1,0 +1,23 @@
+# Secrets
+.env
+client_secret*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Logs
+*.log
+enrich.log
+
+# Data
+*.csv
+*.json
+!railway.json
+!package.json
+
+# IDE
+.vscode/
+.idea/
