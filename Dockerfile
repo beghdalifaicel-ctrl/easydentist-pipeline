@@ -40,4 +40,4 @@ COPY . .
 EXPOSE 8080
 
 # Lancer le webhook Flask via gunicorn
-CMD ["sh", "-c", "gunicorn make_webhook:app --bind 0.0.0.0:${PORT:-8080} --timeout 600 --workers 2"]
+CMD ["sh", "-c", "gunicorn make_webhook:app --bind 0.0.0.0:${PORT:-8080} --timeout 600 --workers 1 --threads 4"]
