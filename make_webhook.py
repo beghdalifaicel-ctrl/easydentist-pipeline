@@ -11,6 +11,7 @@ import os
 import asyncio
 import logging
 import threading
+import traceback
 from datetime import datetime
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
@@ -43,8 +44,10 @@ def run_async_in_thread(coro_func, task_name, **kwargs):
             tasks_status[task_name]["last_result"] = {"status": "success", "detail": str(result)}
             logger.info(f"[{task_name}] Terminé avec succès")
         except Exception as e:
-            tasks_status[task_name]["last_result"] = {"status": "error", "detail": str(e)}
+            tb = traceback.format_exc()
+            tasks_status[task_name]["last_result"] = {"status": "error", "detail": str(e), "traceback": tb}
             logger.error(f"[{task_name}] Erreur: {e}")
+            logger.error(f"[{task_name}] Traceback:\n{tb}")
         finally:
             tasks_status[task_name]["running"] = False
 
