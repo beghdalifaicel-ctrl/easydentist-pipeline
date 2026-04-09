@@ -135,7 +135,7 @@ async def check_batch_http(urls: list[tuple[int, str]], concurrency: int = 3) ->
     results = []
 
     proxy_url = get_proxy_url()
-    log.info(f"Proxy: {'...{proxy_url[-30:]}' if proxy_url else 'AUCUN (direct)'}")
+    log.info(f"  Proxy: {'Bright Data' if proxy_url else 'AUCUN (direct)'}")
     async with httpx.AsyncClient(timeout=20.0, proxy=proxy_url) as client:
 
         async def check_one(row_idx: int, url: str):
@@ -265,7 +265,7 @@ async def run(batch_size: int = 200, start_row: int = 2, concurrency: int = 3,
         # Skip si déjà rempli
         if skip_filled:
             est_val = row[est_col - 1] if len(row) >= est_col else ""
-            if est_val.strip() and est_val.strip() not in ("?", "Erreur", "Timeout"):
+            if est_val.strip() and not est_val.strip().startswith(("?", "Erreur", "Timeout")):
                 continue
 
         work.append((i, url.strip()))
