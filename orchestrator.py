@@ -799,9 +799,65 @@ async def qualify_dentist(
                     decision["priority"] = 2
                     decision["reason"] = "Date d'activité non parsable, traité comme inactif"
         else:
-            decision["action"] = "ADD_TO_PIPELINE"
-            decision["priority"] = 1
-            decision["reason"] = "Jamais contacté (absent de Sellsy)"
+            # Pas de contact trouvé — chercher aussi comme company directement
+            search_words = normalize_name(name).split()
+            search_query = max(search_words, key=len) if search_words else ""
+            matched_companies = []
+            if len(search_query) > 2:
+                companies = await sellsy.search_companies_by_name(search_query)
+                matched_companies = [
+                    c for c in companies
+                    if names_match(name, c.get("name", ""))
+                ]
+
+            if matched_companies:
+                company = matched_companies[0]
+                company_id_check = company.get("id")
+                decision["sellsy_match"] = {
+                    "company_id": company_id_check,
+                    "name": company.get("name", ""),
+                    "last_updated": company.get("updated", ""),
+                }
+
+                # Vérifier si opportunité existante dans Dispo Docto
+                if company_id_check:
+                    existing_opps = await sellsy.get_company_opportunities(
+                        company_id_check, PIPELINE_ID
+                    )
+                    if existing_opps:
+                        decision["action"] = "SKIP"
+                        decision["reason"] = (
+                            f"Company existante avec opportunité dans pipeline Dispo Docto "
+                            f"(ID: {existing_opps[0].get('id')})"
+                        )
+                        return decision
+
+                # Company trouvée mais pas d'opportunité Dispo Docto → check inactivité
+                last_update = company.get("updated", "")
+                if last_update:
+                    try:
+                        update_dt = datetime.fromisoformat(last_update.replace("Z", "+00:00"))
+                        days_since = (datetime.now(update_dt.tzinfo) - update_dt).days
+                        if days_since <= INACTIVITY_DAYS:
+                            decision["action"] = "SKIP"
+                            decision["reason"] = f"Company contactée il y a {days_since} jours (< {INACTIVITY_DAYS}j)"
+                            return decision
+                        else:
+                            decision["action"] = "ADD_TO_PIPELINE"
+                            decision["priority"] = 2
+                            decision["reason"] = f"Company inactive depuis {days_since} jours (> {INACTIVITY_DAYS}j)"
+                    except Exception:
+                        decision["action"] = "ADD_TO_PIPELINE"
+                        decision["priority"] = 2
+                        decision["reason"] = "Company trouvée, date d'activité non parsable, traité comme inactif"
+                else:
+                    decision["action"] = "ADD_TO_PIPELINE"
+                    decision["priority"] = 2
+                    decision["reason"] = "Company existante sans date d'activité"
+            else:
+                decision["action"] = "ADD_TO_PIPELINE"
+                decision["priority"] = 1
+                decision["reason"] = "Jamais contacté (absent de Sellsy)"
     else:
         # Pas de clé Sellsy → tout est Priority 1
         decision["action"] = "ADD_TO_PIPELINE"
