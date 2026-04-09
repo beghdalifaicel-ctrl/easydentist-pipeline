@@ -56,7 +56,7 @@ STEP_INTERESSES_ID = int(os.getenv("STEP_INTERESSES_ID", "774686"))  # À appele
 STAFF_OWNER_ID = int(os.getenv("STAFF_OWNER_ID", "649062"))
 
 # Seuils
-INACTIVITY_DAYS = 60
+INACTIVITY_DAYS = 30
 MAX_DENTISTS_PER_RUN = 200
 
 # Logging
@@ -119,7 +119,7 @@ JS_EXTRACT_DENTISTS = """
 
         const timeSlots = text.match(/\\d{1,2}:\\d{2}/g) || [];
         const todayTomorrow = text.includes("Aujourd") || text.includes("Demain");
-        const hasSlotsThisWeek = timeSlots.length > 0 || todayTomorrow;
+        const hasSlots = timeSlots.length > 0 || todayTomorrow;
 
         results.push({
             name,
@@ -129,7 +129,7 @@ JS_EXTRACT_DENTISTS = """
             phone,
             prochainRdv,
             timeSlotCount: timeSlots.length,
-            hasSlotsThisWeek,
+            hasSlotsThisWeek: hasSlots,
             rawText: text.substring(0, 500)
         });
     });
@@ -208,80 +208,116 @@ JS_CHECK_HAS_NEXT_PAGE = """
 """
 
 
+async def _scrape_pages(browser, url_base: str, city: str, max_pages: int, date_label: str) -> list[dict]:
+    """Scrape les pages de résultats Doctolib pour une URL de base donnée."""
+    dentists = []
+    for page_num in range(1, max_pages + 1):
+        sep = "&" if "?" in url_base else "?"
+        url = url_base if page_num == 1 else f"{url_base}{sep}page={page_num}"
+        log.info(f"  📄 [{date_label}] Page {page_num}: {url}")
+
+        page = await browser.new_page()
+        try:
+            await page.goto(url, timeout=120_000, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30_000)
+            except Exception:
+                pass
+            # Attendre le rendu React
+            await asyncio.sleep(6)
+
+            # Scroll pour charger tout le contenu
+            for _ in range(3):
+                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                await asyncio.sleep(1)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(1)
+
+            # Extraire les dentistes
+            page_dentists = await page.evaluate(JS_EXTRACT_DENTISTS)
+            log.info(f"    → {len(page_dentists)} dentistes trouvés")
+
+            for d in page_dentists:
+                d["source_city"] = city
+                d["source_page"] = page_num
+                d["date_window"] = date_label
+            dentists.extend(page_dentists)
+
+            # Vérifier s'il y a une page suivante
+            pagination = await page.evaluate(JS_CHECK_HAS_NEXT_PAGE)
+            has_more = pagination.get("hasNext") or len(page_dentists) >= 10
+            if not has_more:
+                log.info(f"    → Dernière page atteinte (page {page_num}, {len(page_dentists)} résultats)")
+                break
+
+        except Exception as e:
+            log.error(f"    ❌ Erreur page {page_num}: {e}")
+        finally:
+            await page.close()
+
+    return dentists
+
+
 async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
-    """Scrape les dentistes avec dispo sur Doctolib pour une ville donnée."""
+    """Scrape les dentistes avec dispo sur Doctolib pour une ville (7 jours glissants)."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         log.error("playwright non installé. Installer: pip install playwright && playwright install chromium")
         return []
 
-    all_dentists = []
-    url_base = f"https://www.doctolib.fr/dentiste/{city.lower().replace(' ', '-')}"
+    city_slug = city.lower().replace(' ', '-').replace("'", "-")
+    url_base = f"https://www.doctolib.fr/dentiste/{city_slug}"
 
-    log.info(f"🔍 Scraping Doctolib: {city} (max {max_pages} pages)")
+    # Calculer les deux fenêtres de dates pour couvrir 7 jours glissants
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    # Doctolib affiche ~5-6 jours par vue. On calcule le début de la 2ème fenêtre
+    # pour couvrir les jours restants de la semaine prochaine.
+    # Ex: jeudi 9 → fenêtre 1: jeu-dim (4j), fenêtre 2: lun 13 → mer 15 (3j)
+    days_until_monday = (7 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7  # Si on est lundi, la 2ème fenêtre = lundi prochain
+    next_window_date = (today + timedelta(days=days_until_monday)).strftime("%Y-%m-%d")
+
+    log.info(f"🔍 Scraping Doctolib: {city} (max {max_pages} pages, 7j glissants: {today_str} → +7j)")
+
+    all_dentists = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.connect_over_cdp(SBR_WS)
 
-        for page_num in range(1, max_pages + 1):
-            url = url_base if page_num == 1 else f"{url_base}?page={page_num}"
-            log.info(f"  📄 Page {page_num}: {url}")
+        # Fenêtre 1: cette semaine (vue par défaut, depuis aujourd'hui)
+        url_w1 = f"{url_base}?availability_date={today_str}"
+        w1_dentists = await _scrape_pages(browser, url_w1, city, max_pages, f"semaine1({today_str})")
+        all_dentists.extend(w1_dentists)
 
-            page = await browser.new_page()
-            try:
-                await page.goto(url, timeout=120_000, wait_until="domcontentloaded")
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=30_000)
-                except Exception:
-                    pass
-                # Attendre le rendu React
-                await asyncio.sleep(6)
-
-                # Scroll pour charger tout le contenu
-                for _ in range(3):
-                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    await asyncio.sleep(1)
-                await page.evaluate("window.scrollTo(0, 0)")
-                await asyncio.sleep(1)
-
-                # Extraire les dentistes
-                dentists = await page.evaluate(JS_EXTRACT_DENTISTS)
-                log.info(f"    → {len(dentists)} dentistes trouvés")
-
-                for d in dentists:
-                    d["source_city"] = city
-                    d["source_page"] = page_num
-                all_dentists.extend(dentists)
-
-                # Vérifier s'il y a une page suivante
-                pagination = await page.evaluate(JS_CHECK_HAS_NEXT_PAGE)
-                # Si on a trouvé >= 10 dentistes, il y a probablement une page suivante
-                # Doctolib affiche ~17 résultats par page
-                has_more = pagination.get("hasNext") or len(dentists) >= 10
-                if not has_more:
-                    log.info(f"    → Dernière page atteinte (page {page_num}, {len(dentists)} résultats)")
-                    break
-
-            except Exception as e:
-                log.error(f"    ❌ Erreur page {page_num}: {e}")
-            finally:
-                await page.close()
+        # Fenêtre 2: début semaine prochaine (pour couvrir les jours restants)
+        url_w2 = f"{url_base}?availability_date={next_window_date}"
+        w2_dentists = await _scrape_pages(browser, url_w2, city, max_pages, f"semaine2({next_window_date})")
+        all_dentists.extend(w2_dentists)
 
         await browser.close()
 
-    # Dédupliquer globalement par href
-    seen = set()
-    unique = []
+    # Dédupliquer par href et cumuler les créneaux des deux fenêtres
+    merged = {}
     for d in all_dentists:
-        if d["href"] not in seen:
-            seen.add(d["href"])
-            unique.append(d)
+        href = d["href"]
+        if href not in merged:
+            merged[href] = d.copy()
+            merged[href]["timeSlotCount"] = d.get("timeSlotCount", 0)
+            merged[href]["hasSlotsThisWeek"] = d.get("hasSlotsThisWeek", False)
+        else:
+            # Cumuler les créneaux des deux fenêtres
+            merged[href]["timeSlotCount"] = merged[href].get("timeSlotCount", 0) + d.get("timeSlotCount", 0)
+            merged[href]["hasSlotsThisWeek"] = merged[href]["hasSlotsThisWeek"] or d.get("hasSlotsThisWeek", False)
 
-    # Filtrer: garder seulement ceux avec plus de 5 créneaux cette semaine
+    unique = list(merged.values())
+
+    # Filtrer: garder seulement ceux avec plus de 5 créneaux sur les 7 prochains jours
     MIN_SLOTS = int(os.getenv("MIN_SLOTS", "5"))
     with_slots = [d for d in unique if d.get("hasSlotsThisWeek") and d.get("timeSlotCount", 0) > MIN_SLOTS]
-    log.info(f"📊 {city}: {len(unique)} dentistes uniques, {len(with_slots)} avec >5 créneaux cette semaine")
+    log.info(f"📊 {city}: {len(unique)} dentistes uniques, {len(with_slots)} avec >5 créneaux (7j glissants)")
 
     return with_slots
 
@@ -690,7 +726,7 @@ async def qualify_dentist(
     """
     Qualifie un dentiste selon les règles:
     - Priority 1: Jamais contacté (absent de Sellsy)
-    - Priority 2: Inactif >60 jours dans Sellsy
+    - Priority 2: Inactif >30 jours dans Sellsy
     - Skip: Contacté récemment ou tag bloquant
     """
     decision = {
@@ -784,7 +820,7 @@ async def qualify_dentist(
         doctolib_url = f"https://www.doctolib.fr{dentist['href']}"
         note = (
             f"[Auto-Doctolib {datetime.now().strftime('%Y-%m-%d')}] "
-            f"Dispo cette semaine ({dentist.get('timeSlotCount', 0)} créneaux). "
+            f"Dispo 7j ({dentist.get('timeSlotCount', 0)} créneaux). "
             f"Priority {decision['priority']}. {decision['reason']}. "
             f"URL: {doctolib_url}"
         )
@@ -1102,7 +1138,7 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
     log.info(f"{'═'*50}")
     log.info(f"  📊 Total scrapé avec dispo : {report['metadata']['total_scraped']}")
     log.info(f"  🔴 Priority 1 (jamais contacté) : {report['metadata']['priority_1_count']}")
-    log.info(f"  🟠 Priority 2 (inactif >60j) : {report['metadata']['priority_2_count']}")
+    log.info(f"  🟠 Priority 2 (inactif >30j) : {report['metadata']['priority_2_count']}")
     log.info(f"  ⏭️  Skippé (récemment contacté) : {report['metadata']['skipped_count']}")
     log.info(f"{'═'*50}")
 
