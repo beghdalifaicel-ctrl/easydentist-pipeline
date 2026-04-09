@@ -307,11 +307,28 @@ async def run(batch_size: int = 200, start_row: int = 2, concurrency: int = 3,
             else:
                 total_errors += 1
 
-        # Écrire en batch dans le Sheet
-        if cells_est:
-            ws.update_cells(cells_est)
-        if cells_pas:
-            ws.update_cells(cells_pas)
+        # Écrire en batch dans le Sheet (avec retry sur erreurs Google API)
+        for col_name, cells in [("Est_Sur_Doctolib", cells_est), ("Pas_Sur_Doctolib", cells_pas)]:
+            if not cells:
+                continue
+            for attempt in range(5):
+                try:
+                    ws.update_cells(cells)
+                    break
+                except gspread.exceptions.APIError as api_err:
+                    err_code = str(api_err)
+                    if "500" in err_code or "503" in err_code or "429" in err_code:
+                        wait = 10 * (attempt + 1)
+                        log.warning(f"  ⚠️ Google API error on {col_name} (attempt {attempt+1}/5): {err_code[:80]}. Retry in {wait}s...")
+                        await asyncio.sleep(wait)
+                        if attempt >= 2:
+                            # Reconnect to Google Sheets after multiple failures
+                            log.info("  🔄 Reconnecting to Google Sheets...")
+                            ws = get_worksheet()
+                    else:
+                        raise
+            else:
+                log.error(f"  ❌ Failed to write {col_name} after 5 attempts, skipping batch {batch_num}")
 
         total_checked += len(batch)
         elapsed = time.time() - t_start
