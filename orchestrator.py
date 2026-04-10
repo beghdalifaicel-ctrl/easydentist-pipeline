@@ -56,7 +56,8 @@ STEP_INTERESSES_ID = int(os.getenv("STEP_INTERESSES_ID", "774686"))  # À appele
 STAFF_OWNER_ID = int(os.getenv("STAFF_OWNER_ID", "649062"))
 
 # Seuils
-INACTIVITY_DAYS = 60
+INACTIVITY_DAYS = 30
+CABINET_COOLDOWN_DAYS = 7  # Skip si le même cabinet (même téléphone) a été traité dans les X derniers jours
 MAX_DENTISTS_PER_RUN = 200
 
 # Logging
@@ -119,7 +120,7 @@ JS_EXTRACT_DENTISTS = """
 
         const timeSlots = text.match(/\\d{1,2}:\\d{2}/g) || [];
         const todayTomorrow = text.includes("Aujourd") || text.includes("Demain");
-        const hasSlotsThisWeek = timeSlots.length > 0 || todayTomorrow;
+        const hasSlots = timeSlots.length > 0 || todayTomorrow;
 
         results.push({
             name,
@@ -129,7 +130,7 @@ JS_EXTRACT_DENTISTS = """
             phone,
             prochainRdv,
             timeSlotCount: timeSlots.length,
-            hasSlotsThisWeek,
+            hasSlotsThisWeek: hasSlots,
             rawText: text.substring(0, 500)
         });
     });
@@ -208,80 +209,116 @@ JS_CHECK_HAS_NEXT_PAGE = """
 """
 
 
+async def _scrape_pages(browser, url_base: str, city: str, max_pages: int, date_label: str) -> list[dict]:
+    """Scrape les pages de résultats Doctolib pour une URL de base donnée."""
+    dentists = []
+    for page_num in range(1, max_pages + 1):
+        sep = "&" if "?" in url_base else "?"
+        url = url_base if page_num == 1 else f"{url_base}{sep}page={page_num}"
+        log.info(f"  📄 [{date_label}] Page {page_num}: {url}")
+
+        page = await browser.new_page()
+        try:
+            await page.goto(url, timeout=120_000, wait_until="domcontentloaded")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=30_000)
+            except Exception:
+                pass
+            # Attendre le rendu React
+            await asyncio.sleep(6)
+
+            # Scroll pour charger tout le contenu
+            for _ in range(3):
+                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+                await asyncio.sleep(1)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(1)
+
+            # Extraire les dentistes
+            page_dentists = await page.evaluate(JS_EXTRACT_DENTISTS)
+            log.info(f"    → {len(page_dentists)} dentistes trouvés")
+
+            for d in page_dentists:
+                d["source_city"] = city
+                d["source_page"] = page_num
+                d["date_window"] = date_label
+            dentists.extend(page_dentists)
+
+            # Vérifier s'il y a une page suivante
+            pagination = await page.evaluate(JS_CHECK_HAS_NEXT_PAGE)
+            has_more = pagination.get("hasNext") or len(page_dentists) >= 10
+            if not has_more:
+                log.info(f"    → Dernière page atteinte (page {page_num}, {len(page_dentists)} résultats)")
+                break
+
+        except Exception as e:
+            log.error(f"    ❌ Erreur page {page_num}: {e}")
+        finally:
+            await page.close()
+
+    return dentists
+
+
 async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
-    """Scrape les dentistes avec dispo sur Doctolib pour une ville donnée."""
+    """Scrape les dentistes avec dispo sur Doctolib pour une ville (7 jours glissants)."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         log.error("playwright non installé. Installer: pip install playwright && playwright install chromium")
         return []
 
-    all_dentists = []
-    url_base = f"https://www.doctolib.fr/dentiste/{city.lower().replace(' ', '-')}"
+    city_slug = city.lower().replace(' ', '-').replace("'", "-")
+    url_base = f"https://www.doctolib.fr/dentiste/{city_slug}"
 
-    log.info(f"🔍 Scraping Doctolib: {city} (max {max_pages} pages)")
+    # Calculer les deux fenêtres de dates pour couvrir 7 jours glissants
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    # Doctolib affiche ~5-6 jours par vue. On calcule le début de la 2ème fenêtre
+    # pour couvrir les jours restants de la semaine prochaine.
+    # Ex: jeudi 9 → fenêtre 1: jeu-dim (4j), fenêtre 2: lun 13 → mer 15 (3j)
+    days_until_monday = (7 - today.weekday()) % 7
+    if days_until_monday == 0:
+        days_until_monday = 7  # Si on est lundi, la 2ème fenêtre = lundi prochain
+    next_window_date = (today + timedelta(days=days_until_monday)).strftime("%Y-%m-%d")
+
+    log.info(f"🔍 Scraping Doctolib: {city} (max {max_pages} pages, 7j glissants: {today_str} → +7j)")
+
+    all_dentists = []
 
     async with async_playwright() as pw:
         browser = await pw.chromium.connect_over_cdp(SBR_WS)
 
-        for page_num in range(1, max_pages + 1):
-            url = url_base if page_num == 1 else f"{url_base}?page={page_num}"
-            log.info(f"  📄 Page {page_num}: {url}")
+        # Fenêtre 1: cette semaine (vue par défaut, depuis aujourd'hui)
+        url_w1 = f"{url_base}?availability_date={today_str}"
+        w1_dentists = await _scrape_pages(browser, url_w1, city, max_pages, f"semaine1({today_str})")
+        all_dentists.extend(w1_dentists)
 
-            page = await browser.new_page()
-            try:
-                await page.goto(url, timeout=120_000, wait_until="domcontentloaded")
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=30_000)
-                except Exception:
-                    pass
-                # Attendre le rendu React
-                await asyncio.sleep(6)
-
-                # Scroll pour charger tout le contenu
-                for _ in range(3):
-                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    await asyncio.sleep(1)
-                await page.evaluate("window.scrollTo(0, 0)")
-                await asyncio.sleep(1)
-
-                # Extraire les dentistes
-                dentists = await page.evaluate(JS_EXTRACT_DENTISTS)
-                log.info(f"    → {len(dentists)} dentistes trouvés")
-
-                for d in dentists:
-                    d["source_city"] = city
-                    d["source_page"] = page_num
-                all_dentists.extend(dentists)
-
-                # Vérifier s'il y a une page suivante
-                pagination = await page.evaluate(JS_CHECK_HAS_NEXT_PAGE)
-                # Si on a trouvé >= 10 dentistes, il y a probablement une page suivante
-                # Doctolib affiche ~17 résultats par page
-                has_more = pagination.get("hasNext") or len(dentists) >= 10
-                if not has_more:
-                    log.info(f"    → Dernière page atteinte (page {page_num}, {len(dentists)} résultats)")
-                    break
-
-            except Exception as e:
-                log.error(f"    ❌ Erreur page {page_num}: {e}")
-            finally:
-                await page.close()
+        # Fenêtre 2: début semaine prochaine (pour couvrir les jours restants)
+        url_w2 = f"{url_base}?availability_date={next_window_date}"
+        w2_dentists = await _scrape_pages(browser, url_w2, city, max_pages, f"semaine2({next_window_date})")
+        all_dentists.extend(w2_dentists)
 
         await browser.close()
 
-    # Dédupliquer globalement par href
-    seen = set()
-    unique = []
+    # Dédupliquer par href et cumuler les créneaux des deux fenêtres
+    merged = {}
     for d in all_dentists:
-        if d["href"] not in seen:
-            seen.add(d["href"])
-            unique.append(d)
+        href = d["href"]
+        if href not in merged:
+            merged[href] = d.copy()
+            merged[href]["timeSlotCount"] = d.get("timeSlotCount", 0)
+            merged[href]["hasSlotsThisWeek"] = d.get("hasSlotsThisWeek", False)
+        else:
+            # Cumuler les créneaux des deux fenêtres
+            merged[href]["timeSlotCount"] = merged[href].get("timeSlotCount", 0) + d.get("timeSlotCount", 0)
+            merged[href]["hasSlotsThisWeek"] = merged[href]["hasSlotsThisWeek"] or d.get("hasSlotsThisWeek", False)
 
-    # Filtrer: garder seulement ceux avec plus de 5 créneaux cette semaine
+    unique = list(merged.values())
+
+    # Filtrer: garder seulement ceux avec plus de 5 créneaux sur les 7 prochains jours
     MIN_SLOTS = int(os.getenv("MIN_SLOTS", "5"))
     with_slots = [d for d in unique if d.get("hasSlotsThisWeek") and d.get("timeSlotCount", 0) > MIN_SLOTS]
-    log.info(f"📊 {city}: {len(unique)} dentistes uniques, {len(with_slots)} avec >5 créneaux cette semaine")
+    log.info(f"📊 {city}: {len(unique)} dentistes uniques, {len(with_slots)} avec >5 créneaux (7j glissants)")
 
     return with_slots
 
@@ -415,6 +452,21 @@ class SellsyClient:
             log.debug(f"Sellsy search_companies error: {e}")
         return []
 
+    async def search_companies_by_phone(self, phone: str) -> list[dict]:
+        """Recherche entreprises par numéro de téléphone."""
+        await self._ensure_token()
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/companies/search",
+                json={"filters": {"phone_number": phone}},
+                headers=self.headers
+            )
+            if resp.status_code == 200:
+                return resp.json().get("data", [])
+        except Exception as e:
+            log.debug(f"Sellsy search_companies_by_phone error: {e}")
+        return []
+
     async def get_company(self, company_id: int) -> dict | None:
         """Récupère les détails d'une entreprise."""
         await self._ensure_token()
@@ -465,28 +517,6 @@ class SellsyClient:
         except Exception as e:
             log.debug(f"Sellsy get_contact_company error: {e}")
         return None
-
-    async def get_company_opportunities(self, company_id: int, pipeline_id: int) -> list[dict]:
-        """Retourne les opportunités d'une company dans un pipeline donné."""
-        await self._ensure_token()
-        try:
-            resp = await self.client.post(
-                f"{self.base_url}/opportunities/search",
-                json={
-                    "filters": {
-                        "pipeline_id": pipeline_id,
-                        "related": [{"type": "company", "id": company_id}],
-                    },
-                    "limit": 10,
-                },
-                headers=self.headers
-            )
-            if resp.status_code == 200:
-                return resp.json().get("data", [])
-            log.debug(f"get_company_opportunities {resp.status_code}: {resp.text[:150]}")
-        except Exception as e:
-            log.debug(f"Sellsy get_company_opportunities error: {e}")
-        return []
 
     async def create_opportunity(self, name: str, company_id: int | None,
                                    pipeline_id: int, step_id: int,
@@ -712,7 +742,7 @@ async def qualify_dentist(
     """
     Qualifie un dentiste selon les règles:
     - Priority 1: Jamais contacté (absent de Sellsy)
-    - Priority 2: Inactif >60 jours dans Sellsy
+    - Priority 2: Inactif >30 jours dans Sellsy
     - Skip: Contacté récemment ou tag bloquant
     """
     decision = {
@@ -736,7 +766,39 @@ async def qualify_dentist(
     name = dentist["name"]
     phone = dentist.get("phone", "")
 
-    # ── Sellsy check ──
+    # ── Check cabinet par téléphone (dédup inter-jour) ──
+    # Si un cabinet avec le même téléphone existe déjà dans Sellsy
+    # et a été créé/mis à jour dans les X derniers jours → skip
+    if sellsy and phone:
+        phone_clean = re.sub(r"[\s.+\-]", "", phone)
+        if len(phone_clean) >= 8:
+            phone_companies = await sellsy.search_companies_by_phone(phone)
+            for comp in phone_companies:
+                comp_updated = comp.get("updated_at", "") or comp.get("created", "")
+                comp_name = comp.get("name", "")
+                comp_id = comp.get("id")
+                if comp_updated:
+                    try:
+                        update_dt = datetime.fromisoformat(comp_updated.replace("Z", "+00:00"))
+                        days_since = (datetime.now(update_dt.tzinfo) - update_dt).days
+                        if days_since <= CABINET_COOLDOWN_DAYS:
+                            decision["action"] = "SKIP"
+                            decision["reason"] = (
+                                f"Cabinet déjà traité il y a {days_since}j — "
+                                f"même tél. que \"{comp_name}\" (ID: {comp_id})"
+                            )
+                            decision["sellsy_match"] = {
+                                "company_id": comp_id,
+                                "name": comp_name,
+                                "type": comp.get("type", ""),
+                                "match_type": "phone_cabinet_cooldown",
+                            }
+                            log.info(f"    ⏭️  SKIP cabinet cooldown: {name} → même tél que {comp_name} (ID {comp_id}, {days_since}j)")
+                            return decision
+                    except Exception:
+                        pass
+
+    # ── Sellsy check par nom ──
     sellsy_contacts = []
     if sellsy:
         # Chercher par nom du dentiste
@@ -765,22 +827,6 @@ async def qualify_dentist(
                 "last_updated": last_update,
             }
 
-            # ── Vérifier si une opportunité existe déjà dans le pipeline Dispo Docto ──
-            company_data = await sellsy.get_contact_company(contact["id"])
-            if company_data:
-                company_id_check = company_data.get("id")
-                if company_id_check:
-                    existing_opps = await sellsy.get_company_opportunities(
-                        company_id_check, PIPELINE_ID
-                    )
-                    if existing_opps:
-                        decision["action"] = "SKIP"
-                        decision["reason"] = (
-                            f"Opportunité existante dans pipeline Dispo Docto "
-                            f"(ID: {existing_opps[0].get('id')})"
-                        )
-                        return decision
-
             # Vérifier la date de dernière activité
             if last_update:
                 try:
@@ -799,61 +845,55 @@ async def qualify_dentist(
                     decision["priority"] = 2
                     decision["reason"] = "Date d'activité non parsable, traité comme inactif"
         else:
-            # Pas de contact trouvé — chercher aussi comme company directement
-            search_words = normalize_name(name).split()
-            search_query = max(search_words, key=len) if search_words else ""
-            matched_companies = []
-            if len(search_query) > 2:
-                companies = await sellsy.search_companies_by_name(search_query)
-                matched_companies = [
-                    c for c in companies
-                    if names_match(name, c.get("name", ""))
-                ]
+            # ── Fallback: chercher dans les COMPANIES (prospect ET client) ──
+            matched_company = None
+            if search_words:
+                search_query = max(search_words, key=len)
+                if len(search_query) > 2:
+                    sellsy_companies = await sellsy.search_companies_by_name(search_query)
+                    for comp in sellsy_companies:
+                        comp_name = comp.get("name", "")
+                        comp_phone = comp.get("phone_number", "") or ""
+                        if names_match(name, comp_name) or (phone and comp_phone and phone_matches(phone, {"phone_number": comp_phone})):
+                            matched_company = comp
+                            break
 
-            if matched_companies:
-                company = matched_companies[0]
-                company_id_check = company.get("id")
+            if matched_company:
+                comp_type = matched_company.get("type", "prospect")
+                comp_id = matched_company.get("id")
+                last_update = matched_company.get("updated_at", "") or matched_company.get("updated", "")
                 decision["sellsy_match"] = {
-                    "company_id": company_id_check,
-                    "name": company.get("name", ""),
-                    "last_updated": company.get("updated", ""),
+                    "company_id": comp_id,
+                    "name": matched_company.get("name", ""),
+                    "type": comp_type,
+                    "last_updated": last_update,
                 }
-
-                # Vérifier si opportunité existante dans Dispo Docto
-                if company_id_check:
-                    existing_opps = await sellsy.get_company_opportunities(
-                        company_id_check, PIPELINE_ID
-                    )
-                    if existing_opps:
-                        decision["action"] = "SKIP"
-                        decision["reason"] = (
-                            f"Company existante avec opportunité dans pipeline Dispo Docto "
-                            f"(ID: {existing_opps[0].get('id')})"
-                        )
-                        return decision
-
-                # Company trouvée mais pas d'opportunité Dispo Docto → check inactivité
-                last_update = company.get("updated", "")
-                if last_update:
-                    try:
-                        update_dt = datetime.fromisoformat(last_update.replace("Z", "+00:00"))
-                        days_since = (datetime.now(update_dt.tzinfo) - update_dt).days
-                        if days_since <= INACTIVITY_DAYS:
-                            decision["action"] = "SKIP"
-                            decision["reason"] = f"Company contactée il y a {days_since} jours (< {INACTIVITY_DAYS}j)"
-                            return decision
-                        else:
+                if comp_type == "client":
+                    decision["action"] = "SKIP"
+                    decision["reason"] = f"Déjà client dans Sellsy (company ID: {comp_id})"
+                    return decision
+                else:
+                    # Prospect existant — vérifier inactivité
+                    if last_update:
+                        try:
+                            update_dt = datetime.fromisoformat(last_update.replace("Z", "+00:00"))
+                            days_since = (datetime.now(update_dt.tzinfo) - update_dt).days
+                            if days_since <= INACTIVITY_DAYS:
+                                decision["action"] = "SKIP"
+                                decision["reason"] = f"Prospect existant, mis à jour il y a {days_since}j (< {INACTIVITY_DAYS}j) (company ID: {comp_id})"
+                                return decision
+                            else:
+                                decision["action"] = "ADD_TO_PIPELINE"
+                                decision["priority"] = 2
+                                decision["reason"] = f"Prospect existant inactif depuis {days_since}j (company ID: {comp_id})"
+                        except Exception:
                             decision["action"] = "ADD_TO_PIPELINE"
                             decision["priority"] = 2
-                            decision["reason"] = f"Company inactive depuis {days_since} jours (> {INACTIVITY_DAYS}j)"
-                    except Exception:
+                            decision["reason"] = f"Prospect existant, date non parsable (company ID: {comp_id})"
+                    else:
                         decision["action"] = "ADD_TO_PIPELINE"
                         decision["priority"] = 2
-                        decision["reason"] = "Company trouvée, date d'activité non parsable, traité comme inactif"
-                else:
-                    decision["action"] = "ADD_TO_PIPELINE"
-                    decision["priority"] = 2
-                    decision["reason"] = "Company existante sans date d'activité"
+                        decision["reason"] = f"Prospect existant sans date d'activité (company ID: {comp_id})"
             else:
                 decision["action"] = "ADD_TO_PIPELINE"
                 decision["priority"] = 1
@@ -878,7 +918,7 @@ async def qualify_dentist(
         doctolib_url = f"https://www.doctolib.fr{dentist['href']}"
         note = (
             f"[Auto-Doctolib {datetime.now().strftime('%Y-%m-%d')}] "
-            f"Dispo cette semaine ({dentist.get('timeSlotCount', 0)} créneaux). "
+            f"Dispo 7j ({dentist.get('timeSlotCount', 0)} créneaux). "
             f"Priority {decision['priority']}. {decision['reason']}. "
             f"URL: {doctolib_url}"
         )
@@ -910,14 +950,15 @@ async def qualify_dentist(
                             decision["created_opportunity_id"] = opp_id
 
             elif decision["priority"] == 2:
-                # Prospect existant → récupérer la company via le contact
-                contact_info = decision.get("sellsy_match", {})
-                contact_id = contact_info.get("contact_id")
-                company_id = None
-                if contact_id:
-                    company = await sellsy.get_contact_company(contact_id)
-                    if company:
-                        company_id = company.get("id")
+                # Prospect existant → récupérer la company via le contact OU directement
+                match_info = decision.get("sellsy_match", {})
+                company_id = match_info.get("company_id")  # Direct company match
+                if not company_id:
+                    contact_id = match_info.get("contact_id")
+                    if contact_id:
+                        company = await sellsy.get_contact_company(contact_id)
+                        if company:
+                            company_id = company.get("id")
 
                 if company_id:
                     opp = await sellsy.create_opportunity(
@@ -1196,7 +1237,7 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
     log.info(f"{'═'*50}")
     log.info(f"  📊 Total scrapé avec dispo : {report['metadata']['total_scraped']}")
     log.info(f"  🔴 Priority 1 (jamais contacté) : {report['metadata']['priority_1_count']}")
-    log.info(f"  🟠 Priority 2 (inactif >60j) : {report['metadata']['priority_2_count']}")
+    log.info(f"  🟠 Priority 2 (inactif >30j) : {report['metadata']['priority_2_count']}")
     log.info(f"  ⏭️  Skippé (récemment contacté) : {report['metadata']['skipped_count']}")
     log.info(f"{'═'*50}")
 
