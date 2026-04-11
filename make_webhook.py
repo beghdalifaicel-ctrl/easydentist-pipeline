@@ -2,8 +2,6 @@
 make_webhook.py — Serveur Flask exposant des webhooks pour Railway.
 Endpoints:
   /trigger/enrich    — Lance l'enrichissement Est/Pas sur Doctolib (bulk)
-  /trigger/extract-phones — Lance l'extraction des téléphones depuis Doctolib
-  /trigger/extract-emails — Lance l'extraction des emails depuis Doctolib
   /trigger/orchestrator — Lance le pipeline complet (scrape + qualify)
   /status            — État des tâches en cours
   /health            — Health check Railway
@@ -31,6 +29,7 @@ tasks_status = {
     "orchestrator": {"running": False, "last_run": None, "last_result": None},
     "extract_phones": {"running": False, "last_run": None, "last_result": None},
     "extract_emails": {"running": False, "last_run": None, "last_result": None},
+    "extract_cabinet_name": {"running": False, "last_run": None, "last_result": None},
 }
 
 
@@ -70,6 +69,7 @@ def trigger_enrich():
             "started_at": tasks_status["enrich"]["last_run"],
         }), 409
 
+    # Paramètres optionnels via query string
     batch_size = int(request.args.get("batch_size", 200))
     start_row = int(request.args.get("start_row", 2))
     concurrency = int(request.args.get("concurrency", 10))
@@ -105,6 +105,7 @@ def trigger_orchestrator():
             "started_at": tasks_status["orchestrator"]["last_run"],
         }), 409
 
+    # Paramètres
     city = request.args.get("city", "Paris")
     max_pages = int(request.args.get("max_pages", 5))
     dry_run = request.args.get("dry_run", "false").lower() == "true"
@@ -193,6 +194,37 @@ def trigger_extract_emails():
     }), 200
 
 
+@app.route("/trigger/extract-cabinet-name", methods=["POST", "GET"])
+def trigger_extract_cabinet_name():
+    """Lance l'extraction des noms d'établissements depuis Doctolib."""
+    if tasks_status["extract_cabinet_name"]["running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "L'extraction des noms est déjà en cours",
+            "started_at": tasks_status["extract_cabinet_name"]["last_run"],
+        }), 409
+
+    batch_size = int(request.args.get("batch_size", 100))
+    concurrency = int(request.args.get("concurrency", 3))
+    force = request.args.get("force", "false").lower() == "true"
+
+    from extract_cabinet_name import run as extract_name_run
+
+    run_async_in_thread(
+        extract_name_run,
+        "extract_cabinet_name",
+        batch_size=batch_size,
+        concurrency=concurrency,
+        skip_filled=not force,
+    )
+
+    return jsonify({
+        "status": "started",
+        "message": f"Extraction noms lancée (batch={batch_size}, concurrency={concurrency}, force={force})",
+        "timestamp": datetime.now().isoformat(),
+    }), 200
+
+
 @app.route("/status", methods=["GET"])
 def status():
     """État de toutes les tâches."""
@@ -215,10 +247,10 @@ def index():
             "/trigger/enrich?batch_size=200&concurrency=10&force=false&browser=false": "Params",
             "/trigger/orchestrator": "POST/GET — Pipeline complet Doctolib → Sellsy",
             "/trigger/orchestrator?city=Paris&max_pages=5&dry_run=false": "Params",
-            "/trigger/extract-phones": "POST/GET — Extraction téléphones Doctolib",
-            "/trigger/extract-phones?batch_size=100&concurrency=3&force=false": "Params",
             "/trigger/extract-emails": "POST/GET — Extraction emails Doctolib",
             "/trigger/extract-emails?batch_size=100&concurrency=3&force=false": "Params",
+            "/trigger/extract-cabinet-name": "POST/GET — Extraction noms établissements Doctolib",
+            "/trigger/extract-cabinet-name?batch_size=100&concurrency=3&force=false": "Params",
             "/status": "GET — État des tâches",
             "/health": "GET — Health check",
         },
