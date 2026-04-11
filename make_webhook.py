@@ -1,4 +1,61 @@
-"""\nmake_webhook.py \u2014 Serveur Flask exposant des webhooks pour Railway.\nEndpoints:\n  /trigger/enrich    \u2014 Lance l'enrichissement Est/Pas sur Doctolib (bulk)\n  /trigger/extract-phones \u2014 Lance l'extraction des t\u00e9l\u00e9phones depuis Doctolib\n  /trigger/orchestrator \u2014 Lance le pipeline complet (scrape + qualify)\n  /status            \u2014 \u00c9tat des t\u00e2ches en cours\n  /health            \u2014 Health check Railway\n"""\n\nimport os\nimport asyncio\nimport logging\nimport threading\nimport traceback\nfrom datetime import datetime\nfrom flask import Flask, jsonify, request\nfrom dotenv import load_dotenv\n\nload_dotenv()\n\nlogging.basicConfig(level=logging.INFO, format=\"%(asctime)s [%(levelname)s] %(message)s\")\nlogger = logging.getLogger(__name__)\n\napp = Flask(__name__)\n\n# \u2500\u2500\u2500 \u00c9tat global \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ntasks_status = {\n    \"enrich\": {\"running\": False, \"last_run\": None, \"last_result\": None},\n    \"orchestrator\": {\"running\": False, \"last_run\": None, \"last_result\": None},\n    \"extract_phones\": {\"running\": False, \"last_run\": None, \"last_result\": None},\n}\n\n\n# \u2500\u2500\u2500 Helpers pour lancer les scripts async dans un thread \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\ndef run_async_in_thread(coro_func, task_name, **kwargs):\n    \"\"\"Lance une coroutine dans un nouveau event loop dans un thread.\"\"\"\n    tasks_status[task_name][\"running\"] = True\n    tasks_status[task_name][\"last_run\"] = datetime.now().isoformat()\n\n    def target():\n        try:\n            loop = asyncio.new_event_loop()\n            asyncio.set_event_loop(loop)\n            result = loop.run_until_complete(coro_func(**kwargs))\n            tasks_status[task_name][\"last_result\"] = {\"status\": \"success\", \"detail\": str(result)}\n            logger.info(f\"[{task_name}] Termin\u00e9 avec succ\u00e8s\")\n        except Exception as e:\n            tb = traceback.format_exc()\n            tasks_status[task_name][\"last_result\"] = {\"status\": \"error\", \"detail\": str(e), \"traceback\": tb}\n            logger.error(f\"[{task_name}] Erreur: {e}\")\n            logger.error(f\"[{task_name}] Traceback:\\n{tb}\")\n        finally:\n            tasks_status[task_name][\"running\"] = False\n\n    thread = threading.Thread(target=target, daemon=True)\n    thread.start()\n
+"""
+make_webhook.py — Serveur Flask exposant des webhooks pour Railway.
+Endpoints:
+  /trigger/enrich    — Lance l'enrichissement Est/Pas sur Doctolib (bulk)
+  /trigger/extract-phones — Lance l'extraction des téléphones depuis Doctolib
+  /trigger/orchestrator — Lance le pipeline complet (scrape + qualify)
+  /status            — État des tâches en cours
+  /health            — Health check Railway
+"""
+
+import os
+import asyncio
+import logging
+import threading
+import traceback
+from datetime import datetime
+from flask import Flask, jsonify, request
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# ─── État global ────────────────────────────────────────────────────────────
+tasks_status = {
+    "enrich": {"running": False, "last_run": None, "last_result": None},
+    "orchestrator": {"running": False, "last_run": None, "last_result": None},
+    "extract_phones": {"running": False, "last_run": None, "last_result": None},
+}
+
+
+# ─── Helpers pour lancer les scripts async dans un thread ───────────────────
+def run_async_in_thread(coro_func, task_name, **kwargs):
+    """Lance une coroutine dans un nouveau event loop dans un thread."""
+    tasks_status[task_name]["running"] = True
+    tasks_status[task_name]["last_run"] = datetime.now().isoformat()
+
+    def target():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro_func(**kwargs))
+            tasks_status[task_name]["last_result"] = {"status": "success", "detail": str(result)}
+            logger.info(f"[{task_name}] Terminé avec succès")
+        except Exception as e:
+            tb = traceback.format_exc()
+            tasks_status[task_name]["last_result"] = {"status": "error", "detail": str(e), "traceback": tb}
+            logger.error(f"[{task_name}] Erreur: {e}")
+            logger.error(f"[{task_name}] Traceback:\n{tb}")
+        finally:
+            tasks_status[task_name]["running"] = False
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+
 
 # ─── Endpoints ──────────────────────────────────────────────────────────────
 @app.route("/trigger/enrich", methods=["POST", "GET"])
@@ -66,6 +123,7 @@ def trigger_orchestrator():
         "message": f"Orchestrateur lancé (city={city}, max_pages={max_pages}, dry_run={dry_run})",
         "timestamp": datetime.now().isoformat(),
     }), 200
+
 
 @app.route("/trigger/extract-phones", methods=["POST", "GET"])
 def trigger_extract_phones():
