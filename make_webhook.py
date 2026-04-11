@@ -3,6 +3,7 @@ make_webhook.py — Serveur Flask exposant des webhooks pour Railway.
 Endpoints:
   /trigger/enrich    — Lance l'enrichissement Est/Pas sur Doctolib (bulk)
   /trigger/extract-phones — Lance l'extraction des téléphones depuis Doctolib
+  /trigger/extract-emails — Lance l'extraction des emails depuis Doctolib
   /trigger/orchestrator — Lance le pipeline complet (scrape + qualify)
   /status            — État des tâches en cours
   /health            — Health check Railway
@@ -29,6 +30,7 @@ tasks_status = {
     "enrich": {"running": False, "last_run": None, "last_result": None},
     "orchestrator": {"running": False, "last_run": None, "last_result": None},
     "extract_phones": {"running": False, "last_run": None, "last_result": None},
+    "extract_emails": {"running": False, "last_run": None, "last_result": None},
 }
 
 
@@ -158,6 +160,39 @@ def trigger_extract_phones():
     }), 200
 
 
+@app.route("/trigger/extract-emails", methods=["POST", "GET"])
+def trigger_extract_emails():
+    """Lance l'extraction des emails depuis les profils Doctolib."""
+    if tasks_status["extract_emails"]["running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "L'extraction des emails est déjà en cours",
+            "started_at": tasks_status["extract_emails"]["last_run"],
+        }), 409
+
+    batch_size = int(request.args.get("batch_size", 100))
+    start_row = int(request.args.get("start_row", 2))
+    concurrency = int(request.args.get("concurrency", 3))
+    force = request.args.get("force", "false").lower() == "true"
+
+    from extract_emails_doctolib import run as extract_emails_run
+
+    run_async_in_thread(
+        extract_emails_run,
+        "extract_emails",
+        batch_size=batch_size,
+        start_row=start_row,
+        concurrency=concurrency,
+        skip_filled=not force,
+    )
+
+    return jsonify({
+        "status": "started",
+        "message": f"Extraction emails lancée (batch={batch_size}, concurrency={concurrency}, force={force})",
+        "timestamp": datetime.now().isoformat(),
+    }), 200
+
+
 @app.route("/status", methods=["GET"])
 def status():
     """État de toutes les tâches."""
@@ -182,6 +217,8 @@ def index():
             "/trigger/orchestrator?city=Paris&max_pages=5&dry_run=false": "Params",
             "/trigger/extract-phones": "POST/GET — Extraction téléphones Doctolib",
             "/trigger/extract-phones?batch_size=100&concurrency=3&force=false": "Params",
+            "/trigger/extract-emails": "POST/GET — Extraction emails Doctolib",
+            "/trigger/extract-emails?batch_size=100&concurrency=3&force=false": "Params",
             "/status": "GET — État des tâches",
             "/health": "GET — Health check",
         },
