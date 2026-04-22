@@ -60,6 +60,24 @@ INACTIVITY_DAYS = 30
 CABINET_COOLDOWN_DAYS = 7  # Skip si le même cabinet (même téléphone) a été traité dans les X derniers jours
 MAX_DENTISTS_PER_RUN = 200
 
+# Réseaux / chaînes de centres dentaires à exclure
+NETWORK_BRANDS = [
+    "dentego", "dentelia", "dental access", "dentifree", "dentalvie",
+    "vertuo", "docali", "dentasmile", "dentoclic", "dentylis",
+    "dentisme", "dentup", "smile partner", "smilepartner", "addentis",
+    "dentexia", "centre dentaire mutualiste", "mutualité française",
+    "dental studio", "clinadent", "dentaplus", "dentalcoop",
+    "medident", "pridental", "dentego kids", "dentalaxy",
+    "dental santé", "oralyo", "dentifirst", "body dentist",
+]
+NETWORK_KEYWORDS = [
+    r"réseau\s+de\s+centres?",
+    r"groupe\s+dentaire",
+    r"chaîne\s+dentaire",
+    r"centres?\s+dentaires?\s+(?:de\s+)?(?:la\s+)?mutuali",
+    r"franchise\s+dentaire",
+]
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -690,6 +708,32 @@ class RingoverClient:
 # ÉTAPE 4 : LOGIQUE DE QUALIFICATION + PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def is_dental_network(dentist: dict) -> str | None:
+    """
+    Détecte si un dentiste/cabinet appartient à un réseau ou une chaîne.
+    Retourne le nom du réseau détecté, ou None si c'est un cabinet indépendant.
+    Vérifie dans le nom, l'adresse et le rawText.
+    """
+    fields_to_check = " ".join([
+        dentist.get("name", ""),
+        dentist.get("address", ""),
+        dentist.get("rawText", ""),
+    ]).lower()
+
+    # 1. Match par marques connues
+    for brand in NETWORK_BRANDS:
+        if brand in fields_to_check:
+            return brand.title()
+
+    # 2. Match par mots-clés / patterns regex
+    for pattern in NETWORK_KEYWORDS:
+        if re.search(pattern, fields_to_check, re.IGNORECASE):
+            match = re.search(pattern, fields_to_check, re.IGNORECASE)
+            return match.group(0).strip()
+
+    return None
+
+
 def normalize_name(name: str) -> str:
     """Normalise un nom pour la comparaison."""
     name = name.lower().strip()
@@ -765,6 +809,14 @@ async def qualify_dentist(
 
     name = dentist["name"]
     phone = dentist.get("phone", "")
+
+    # ── Filtre réseaux de centres dentaires ──
+    network = is_dental_network(dentist)
+    if network:
+        decision["action"] = "SKIP"
+        decision["reason"] = f'Réseau/chaîne détecté : "{network}" — pas une cible EasyDentist'
+        log.info(f'    🏢 SKIP réseau: {name} → {network}')
+        return decision
 
     # ── Check cabinet par téléphone (dédup inter-jour) ──
     # Si un cabinet avec le même téléphone existe déjà dans Sellsy
@@ -1039,6 +1091,7 @@ def generate_report(decisions: list[dict], city: str) -> dict:
     p1 = [d for d in decisions if d.get("priority") == 1]
     p2 = [d for d in decisions if d.get("priority") == 2]
     skipped = [d for d in decisions if d.get("action") == "SKIP"]
+    networks = [d for d in skipped if "réseau" in (d.get("reason") or "").lower() or "chaîne" in (d.get("reason") or "").lower()]
 
     report = {
         "metadata": {
@@ -1048,6 +1101,7 @@ def generate_report(decisions: list[dict], city: str) -> dict:
             "priority_1_count": len(p1),
             "priority_2_count": len(p2),
             "skipped_count": len(skipped),
+            "network_skipped_count": len(networks),
         },
         "priority_1": [
             {
