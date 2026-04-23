@@ -69,6 +69,7 @@ NETWORK_BRANDS = [
     "dental studio", "clinadent", "dentaplus", "dentalcoop",
     "medident", "pridental", "dentego kids", "dentalaxy",
     "dental santé", "oralyo", "dentifirst", "body dentist",
+    "santé+", "sante+", "medismile",
 ]
 NETWORK_KEYWORDS = [
     r"réseau\s+de\s+centres?",
@@ -586,6 +587,38 @@ class SellsyClient:
             log.debug(f"Sellsy create_comment error: {e}")
         return None
 
+    async def load_client_companies(self) -> list[dict]:
+        """Charge toutes les companies de type 'client' depuis Sellsy (paginé)."""
+        await self._ensure_token()
+        clients = []
+        offset = 0
+        limit = 100
+        while True:
+            try:
+                resp = await self.client.post(
+                    f"{self.base_url}/companies/search",
+                    json={
+                        "filters": {"type": ["client"]},
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                    headers=self.headers
+                )
+                if resp.status_code == 200:
+                    data = resp.json().get("data", [])
+                    clients.extend(data)
+                    if len(data) < limit:
+                        break
+                    offset += limit
+                else:
+                    log.warning(f"Sellsy load_client_companies page {offset}: {resp.status_code}")
+                    break
+            except Exception as e:
+                log.warning(f"Sellsy load_client_companies error: {e}")
+                break
+        log.info(f"📋 {len(clients)} companies 'client' chargées depuis Sellsy")
+        return clients
+
     async def close(self):
         await self.client.aclose()
 
@@ -708,6 +741,51 @@ class RingoverClient:
 # ÉTAPE 4 : LOGIQUE DE QUALIFICATION + PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def is_existing_client(dentist: dict, client_keywords: list[str]) -> str | None:
+    """
+    Vérifie si un dentiste scrappé appartient à une company "client" de Sellsy.
+    client_keywords = liste de mots-clés extraits des noms des companies clients.
+    Retourne le mot-clé matché, ou None.
+    """
+    if not client_keywords:
+        return None
+    fields_to_check = " ".join([
+        dentist.get("name", ""),
+        dentist.get("address", ""),
+        dentist.get("rawText", ""),
+        dentist.get("href", ""),
+    ]).lower()
+    for kw in client_keywords:
+        if kw in fields_to_check:
+            return kw
+    return None
+
+
+def extract_client_keywords(client_companies: list[dict]) -> list[str]:
+    """
+    Extrait des mots-clés discriminants des noms de companies clients Sellsy.
+    Filtre les mots trop courts ou génériques pour éviter les faux positifs.
+    """
+    GENERIC_WORDS = {
+        "dr", "centre", "cabinet", "dentaire", "dentaires", "dental",
+        "de", "du", "la", "le", "les", "des", "et", "à", "a",
+        "paris", "lyon", "marseille", "toulouse", "nice", "nantes",
+        "montpellier", "strasbourg", "bordeaux", "lille", "rennes",
+        "saint", "sur", "en", "sous", "chez",
+    }
+    keywords = set()
+    for comp in client_companies:
+        name = comp.get("name", "").lower().strip()
+        if not name:
+            continue
+        words = re.split(r"[\s\-\–\—/,()]+", name)
+        for word in words:
+            word = word.strip().lower()
+            if len(word) > 3 and word not in GENERIC_WORDS:
+                keywords.add(word)
+    return sorted(keywords)
+
+
 def is_dental_network(dentist: dict) -> str | None:
     """
     Détecte si un dentiste/cabinet appartient à un réseau ou une chaîne.
@@ -781,7 +859,8 @@ async def qualify_dentist(
     dentist: dict,
     sellsy: SellsyClient,
     ringover: RingoverClient,
-    dry_run: bool = False
+    dry_run: bool = False,
+    client_keywords: list[str] | None = None,
 ) -> dict:
     """
     Qualifie un dentiste selon les règles:
@@ -1092,6 +1171,7 @@ def generate_report(decisions: list[dict], city: str) -> dict:
     p2 = [d for d in decisions if d.get("priority") == 2]
     skipped = [d for d in decisions if d.get("action") == "SKIP"]
     networks = [d for d in skipped if "réseau" in (d.get("reason") or "").lower() or "chaîne" in (d.get("reason") or "").lower()]
+    clients_skipped = [d for d in skipped if "client existant" in (d.get("reason") or "").lower() or "déjà client" in (d.get("reason") or "").lower()]
 
     report = {
         "metadata": {
@@ -1102,6 +1182,7 @@ def generate_report(decisions: list[dict], city: str) -> dict:
             "priority_2_count": len(p2),
             "skipped_count": len(skipped),
             "network_skipped_count": len(networks),
+            "client_skipped_count": len(clients_skipped),
         },
         "priority_1": [
             {
@@ -1293,6 +1374,16 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
     if ringover and RINGOVER_API_KEY:
         await ringover.load_contacts_cache()
 
+    # Charger les companies "client" pour exclure les clients existants
+    _client_keywords: list[str] = []
+    if sellsy:
+        try:
+            client_companies = await sellsy.load_client_companies()
+            _client_keywords = extract_client_keywords(client_companies)
+            log.info(f"🔑 {len(_client_keywords)} mots-clés clients extraits pour le filtre")
+        except Exception as e:
+            log.warning(f"Impossible de charger les clients Sellsy: {e}")
+
     # 2-3. Qualifier chaque dentiste
     # ── Dédup intra-run par URL Doctolib ──
     seen_urls: set[str] = set()
@@ -1312,7 +1403,8 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
             dentist,
             sellsy,
             ringover,
-            dry_run=dry_run
+            dry_run=dry_run,
+            client_keywords=_client_keywords,
         )
         decisions.append(decision)
         log.info(f"    → {decision['action']} (P{decision.get('priority', '-')}) — {decision['reason']}")
