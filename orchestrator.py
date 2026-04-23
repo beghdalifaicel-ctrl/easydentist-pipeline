@@ -365,19 +365,24 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
     all_dentists = []
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.connect_over_cdp(SBR_WS)
+        try:
+            browser = await pw.chromium.connect_over_cdp(SBR_WS, timeout=60000)
+        except Exception as e:
+            log.error(f"❌ Connexion Bright Data échouée pour {city}: {e}")
+            return []
 
-        # Fenêtre 1: cette semaine (vue par défaut, depuis aujourd'hui)
-        url_w1 = f"{url_base}?availability_date={today_str}"
-        w1_dentists = await _scrape_pages(browser, url_w1, city, max_pages, f"semaine1({today_str})")
-        all_dentists.extend(w1_dentists)
+        try:
+            # Fenêtre 1: cette semaine (vue par défaut, depuis aujourd'hui)
+            url_w1 = f"{url_base}?availability_date={today_str}"
+            w1_dentists = await _scrape_pages(browser, url_w1, city, max_pages, f"semaine1({today_str})")
+            all_dentists.extend(w1_dentists)
 
-        # Fenêtre 2: début semaine prochaine (pour couvrir les jours restants)
-        url_w2 = f"{url_base}?availability_date={next_window_date}"
-        w2_dentists = await _scrape_pages(browser, url_w2, city, max_pages, f"semaine2({next_window_date})")
-        all_dentists.extend(w2_dentists)
-
-        await browser.close()
+            # Fenêtre 2: début semaine prochaine (pour couvrir les jours restants)
+            url_w2 = f"{url_base}?availability_date={next_window_date}"
+            w2_dentists = await _scrape_pages(browser, url_w2, city, max_pages, f"semaine2({next_window_date})")
+            all_dentists.extend(w2_dentists)
+        finally:
+            await browser.close()
 
     # Dédupliquer par href et cumuler les créneaux des deux fenêtres
     merged = {}
@@ -419,39 +424,48 @@ async def check_doctolib_profiles(dentists: list[dict]) -> list[dict]:
     log.info(f"🔍 Vérification profils Doctolib pour {len(dentists)} dentistes...")
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.connect_over_cdp(SBR_WS)
-        page = await browser.new_page()
+        try:
+            browser = await pw.chromium.connect_over_cdp(SBR_WS, timeout=60000)
+        except Exception as e:
+            log.error(f"❌ Connexion Bright Data échouée pour check_doctolib_profiles: {e}")
+            for d in dentists:
+                d["est_sur_doctolib"] = "Erreur connexion"
+                d["pas_sur_doctolib"] = "Erreur connexion"
+            return dentists
 
-        for i, dentist in enumerate(dentists):
-            href = dentist.get("href", "")
-            url = f"https://www.doctolib.fr{href}"
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(5000)
-                result = await page.evaluate(JS_CHECK_IS_ON_DOCTOLIB)
+        try:
+            page = await browser.new_page()
 
-                if result.get("notOnDoctolib"):
-                    dentist["est_sur_doctolib"] = "Non"
-                    dentist["pas_sur_doctolib"] = "Oui"
-                    log.info(f"  [{i+1}/{len(dentists)}] {dentist['name']} → ❌ N'est PAS sur Doctolib")
-                elif result.get("isOnDoctolib"):
-                    dentist["est_sur_doctolib"] = "Oui"
-                    dentist["pas_sur_doctolib"] = "Non"
-                    log.info(f"  [{i+1}/{len(dentists)}] {dentist['name']} → ✅ Est sur Doctolib")
-                else:
-                    dentist["est_sur_doctolib"] = "?"
-                    dentist["pas_sur_doctolib"] = "?"
-                    log.info(f"  [{i+1}/{len(dentists)}] {dentist['name']} → ❓ Indéterminé (titre: {result.get('title', '')[:60]})")
-                    log.debug(f"    Body: {result.get('bodySnippet', '')[:200]}")
+            for i, dentist in enumerate(dentists):
+                href = dentist.get("href", "")
+                url = f"https://www.doctolib.fr{href}"
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(5000)
+                    result = await page.evaluate(JS_CHECK_IS_ON_DOCTOLIB)
 
-            except Exception as e:
-                log.warning(f"  [{i+1}/{len(dentists)}] {dentist['name']} → Erreur: {e}")
-                dentist["est_sur_doctolib"] = "Erreur"
-                dentist["pas_sur_doctolib"] = "Erreur"
+                    if result.get("notOnDoctolib"):
+                        dentist["est_sur_doctolib"] = "Non"
+                        dentist["pas_sur_doctolib"] = "Oui"
+                        log.info(f"  [{i+1}/{len(dentists)}] {dentist['name']} → ❌ N'est PAS sur Doctolib")
+                    elif result.get("isOnDoctolib"):
+                        dentist["est_sur_doctolib"] = "Oui"
+                        dentist["pas_sur_doctolib"] = "Non"
+                        log.info(f"  [{i+1}/{len(dentists)}] {dentist['name']} → ✅ Est sur Doctolib")
+                    else:
+                        dentist["est_sur_doctolib"] = "?"
+                        dentist["pas_sur_doctolib"] = "?"
+                        log.info(f"  [{i+1}/{len(dentists)}] {dentist['name']} → ❓ Indéterminé (titre: {result.get('title', '')[:60]})")
+                        log.debug(f"    Body: {result.get('bodySnippet', '')[:200]}")
 
-            await page.wait_for_timeout(500)
+                except Exception as e:
+                    log.warning(f"  [{i+1}/{len(dentists)}] {dentist['name']} → Erreur: {e}")
+                    dentist["est_sur_doctolib"] = "Erreur"
+                    dentist["pas_sur_doctolib"] = "Erreur"
 
-        await browser.close()
+                await page.wait_for_timeout(500)
+        finally:
+            await browser.close()
 
     return dentists
 
@@ -1679,11 +1693,16 @@ async def run_daily(
         log.info(f"{'─'*50}")
 
         try:
-            report = await run(
-                city=city,
-                max_pages=max_pages,
-                dry_run=dry_run,
-                output_dir=output_dir,
+            # Timeout de 10 minutes par ville pour éviter les blocages
+            CITY_TIMEOUT = int(os.getenv("CITY_TIMEOUT_SECONDS", "600"))
+            report = await asyncio.wait_for(
+                run(
+                    city=city,
+                    max_pages=max_pages,
+                    dry_run=dry_run,
+                    output_dir=output_dir,
+                ),
+                timeout=CITY_TIMEOUT,
             )
 
             prospects_count = 0
@@ -1710,6 +1729,17 @@ async def run_daily(
             if target_prospects and total_prospects >= target_prospects:
                 log.info(f"\n🎯 Objectif atteint ({total_prospects}/{target_prospects}) — arrêt anticipé")
                 break
+
+        except asyncio.TimeoutError:
+            log.error(f"  ⏰ {city}: TIMEOUT après {CITY_TIMEOUT}s — on passe à la suivante")
+            update_rotation_state(city, 0)
+            results.append({
+                "city": city,
+                "status": "timeout",
+                "error": f"Timeout après {CITY_TIMEOUT}s",
+                "prospects": 0,
+            })
+            cities_processed += 1
 
         except Exception as e:
             log.error(f"  ❌ {city}: {e}")
