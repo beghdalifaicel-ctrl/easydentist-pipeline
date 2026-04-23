@@ -1426,7 +1426,7 @@ def update_google_sheet(decisions: list[dict]):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: str = "."):
+async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: str = ".", global_seen_urls: set | None = None):
     """Exécute le pipeline complet pour une ville."""
     log.info(f"═══════════════════════════════════════════")
     log.info(f"  ORCHESTRATEUR EASYDENTIST — {city.upper()}")
@@ -1470,7 +1470,8 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
 
     # 2-3. Qualifier chaque dentiste
     # ── Dédup intra-run par URL Doctolib ──
-    seen_urls: set[str] = set()
+    # Utilise le set global (partagé entre villes dans run_daily) si fourni
+    seen_urls: set[str] = global_seen_urls if global_seen_urls is not None else set()
 
     decisions = []
     for i, dentist in enumerate(dentists[:MAX_DENTISTS_PER_RUN]):
@@ -1687,6 +1688,10 @@ async def run_daily(
     cities_processed = 0
     cities_with_results = 0
 
+    # Set global de dédup inter-villes : évite de recréer le même prospect
+    # quand un dentiste apparaît dans les résultats de plusieurs villes voisines
+    global_seen_urls: set[str] = set()
+
     for i, city in enumerate(cities):
         log.info(f"\n{'─'*50}")
         log.info(f"  [{i+1}/{len(cities)}] {city}")
@@ -1701,6 +1706,7 @@ async def run_daily(
                     max_pages=max_pages,
                     dry_run=dry_run,
                     output_dir=output_dir,
+                    global_seen_urls=global_seen_urls,
                 ),
                 timeout=CITY_TIMEOUT,
             )
