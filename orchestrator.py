@@ -59,6 +59,66 @@ STAFF_OWNER_ID = int(os.getenv("STAFF_OWNER_ID", "649062"))
 INACTIVITY_DAYS = 30
 CABINET_COOLDOWN_DAYS = 7  # Skip si le même cabinet (même téléphone) a été traité dans les X derniers jours
 MAX_DENTISTS_PER_RUN = 200
+DAILY_CITY_BATCH = int(os.getenv("DAILY_CITY_BATCH", "30"))  # Nombre de villes par run quotidien
+ROTATION_STATE_FILE = os.getenv("ROTATION_STATE_FILE", "rotation_state.json")
+
+# ─── Pool complet de villes françaises (~130) ────────────────────────────────
+# Groupées par zone pour éviter le chevauchement géographique
+CITIES_IDF = [
+    "Paris", "Versailles", "Boulogne-Billancourt", "Saint-Denis", "Montreuil",
+    "Argenteuil", "Créteil", "Vitry-sur-Seine", "Colombes", "Asnières-sur-Seine",
+    "Courbevoie", "Nanterre", "Aubervilliers", "Aulnay-sous-Bois",
+    "Champigny-sur-Marne", "Rueil-Malmaison", "Saint-Maur-des-Fossés",
+    "Issy-les-Moulineaux", "Levallois-Perret", "Noisy-le-Grand",
+    "Neuilly-sur-Seine", "Cergy", "Ivry-sur-Seine", "Clamart",
+    "Fontenay-sous-Bois", "Sartrouville", "Suresnes", "Drancy", "Meaux",
+    "Pantin", "Évry-Courcouronnes", "Massy", "Chelles", "Maisons-Alfort",
+    "Bobigny", "Saint-Ouen-sur-Seine", "Rosny-sous-Bois", "Gennevilliers",
+    "Corbeil-Essonnes", "Vincennes", "Saint-Germain-en-Laye", "Poissy",
+    "Villejuif", "Montrouge", "Pontoise",
+]
+CITIES_NORD = [
+    "Lille", "Roubaix", "Tourcoing", "Dunkerque", "Calais", "Valenciennes",
+    "Douai", "Arras", "Lens", "Cambrai", "Maubeuge", "Boulogne-sur-Mer",
+    "Béthune", "Amiens", "Beauvais", "Compiègne", "Saint-Quentin",
+]
+CITIES_EST = [
+    "Strasbourg", "Metz", "Nancy", "Mulhouse", "Colmar", "Reims",
+    "Thionville", "Haguenau", "Belfort", "Troyes", "Charleville-Mézières",
+    "Épinal", "Dijon", "Besançon", "Auxerre", "Chalon-sur-Saône",
+]
+CITIES_OUEST = [
+    "Nantes", "Rennes", "Brest", "Le Mans", "Tours", "Caen", "Rouen",
+    "Saint-Brieuc", "Quimper", "Lorient", "Vannes", "Laval",
+    "Saint-Nazaire", "Cholet", "La Roche-sur-Yon", "Saint-Malo",
+    "Cherbourg-en-Cotentin", "Évreux", "Chartres", "Blois", "Bourges",
+    "Le Havre", "Angers", "Orléans", "Poitiers", "La Rochelle", "Niort",
+]
+CITIES_SUD_OUEST = [
+    "Bordeaux", "Toulouse", "Pau", "Bayonne", "Limoges",
+    "Tarbes", "Agen", "Mont-de-Marsan", "Périgueux", "Anglet",
+    "Biarritz", "Bergerac",
+]
+CITIES_SUD_EST = [
+    "Lyon", "Marseille", "Nice", "Montpellier", "Toulon",
+    "Grenoble", "Saint-Étienne", "Nîmes", "Villeurbanne",
+    "Clermont-Ferrand", "Aix-en-Provence", "Perpignan", "Béziers",
+    "Avignon", "Cannes", "Antibes", "Valence", "Annecy", "Chambéry",
+    "Fréjus", "Hyères", "Arles", "Salon-de-Provence",
+    "Aubagne", "La Seyne-sur-Mer", "Draguignan",
+    "Narbonne", "Carcassonne", "Sète", "Vichy", "Bourg-en-Bresse",
+    "Romans-sur-Isère", "Gap", "Montluçon",
+]
+CITIES_DOM = [
+    "Ajaccio", "Bastia",
+]
+
+ALL_CITIES_FRANCE = (
+    CITIES_IDF + CITIES_NORD + CITIES_EST + CITIES_OUEST
+    + CITIES_SUD_OUEST + CITIES_SUD_EST + CITIES_DOM
+)
+# Dédupliquer tout en préservant l'ordre
+ALL_CITIES_FRANCE = list(dict.fromkeys(ALL_CITIES_FRANCE))
 
 # Réseaux / chaînes de centres dentaires à exclure
 NETWORK_BRANDS = [
@@ -335,7 +395,7 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
     unique = list(merged.values())
 
     # Filtrer: garder seulement ceux avec plus de 5 créneaux sur les 7 prochains jours
-    MIN_SLOTS = int(os.getenv("MIN_SLOTS", "5"))
+    MIN_SLOTS = int(os.getenv("MIN_SLOTS", "2"))
     with_slots = [d for d in unique if d.get("hasSlotsThisWeek") and d.get("timeSlotCount", 0) > MIN_SLOTS]
     log.info(f"📊 {city}: {len(unique)} dentistes uniques, {len(with_slots)} avec >5 créneaux (7j glissants)")
 
@@ -778,7 +838,9 @@ def extract_client_keywords(client_companies: list[dict]) -> list[str]:
         name = comp.get("name", "").lower().strip()
         if not name:
             continue
-        words = re.split(r"[\s\-\–\—/,()]+", name)
+        # Garder le nom complet normalisé
+        # Extraire aussi chaque mot significatif (>3 chars, non générique)
+        words = re.split(r"[\s\-–—/,()]+", name)
         for word in words:
             word = word.strip().lower()
             if len(word) > 3 and word not in GENERIC_WORDS:
@@ -893,8 +955,16 @@ async def qualify_dentist(
     network = is_dental_network(dentist)
     if network:
         decision["action"] = "SKIP"
-        decision["reason"] = f'Réseau/chaîne détecté : "{network}" — pas une cible EasyDentist'
-        log.info(f'    🏢 SKIP réseau: {name} → {network}')
+        decision["reason"] = f"Réseau/chaîne détecté : \"{network}\" — pas une cible EasyDentist"
+        log.info(f"    🏢 SKIP réseau: {name} → {network}")
+        return decision
+
+    # ── Filtre clients existants EasyDentist ──
+    client_match = is_existing_client(dentist, client_keywords or [])
+    if client_match:
+        decision["action"] = "SKIP"
+        decision["reason"] = f"Client existant détecté : \"{client_match}\" — déjà client EasyDentist"
+        log.info(f"    💼 SKIP client: {name} → {client_match}")
         return decision
 
     # ── Check cabinet par téléphone (dédup inter-jour) ──
@@ -1447,33 +1517,278 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
     return report
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ROTATION — Sélection intelligente des villes quotidiennes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_rotation_state() -> dict:
+    """Charge l'état de rotation depuis le fichier JSON."""
+    path = Path(ROTATION_STATE_FILE)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_rotation_state(state: dict):
+    """Sauvegarde l'état de rotation."""
+    Path(ROTATION_STATE_FILE).write_text(
+        json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def pick_daily_cities(batch_size: int = DAILY_CITY_BATCH) -> list[str]:
+    """
+    Sélectionne les villes du jour par rotation intelligente.
+    Priorité :
+      1. Villes jamais scrapées (pool neuf)
+      2. Villes non scrapées depuis le plus longtemps
+      3. À yield égal, favorise les villes qui ont historiquement le plus de résultats
+    Contrainte : max 8 villes IDF par batch (éviter chevauchement Paris)
+    """
+    state = load_rotation_state()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    idf_set = set(c.lower() for c in CITIES_IDF)
+    MAX_IDF_PER_BATCH = 8
+
+    # Calculer un score pour chaque ville
+    scored = []
+    for city in ALL_CITIES_FRANCE:
+        city_state = state.get(city, {})
+        last_scraped = city_state.get("last_scraped", "")
+        avg_yield = city_state.get("avg_yield", 5.0)  # Défaut optimiste pour les nouvelles
+        total_runs = city_state.get("total_runs", 0)
+
+        # Skip si déjà scrapée aujourd'hui
+        if last_scraped == today_str:
+            continue
+
+        # Score = jours depuis dernier scrape × rendement moyen
+        if last_scraped:
+            try:
+                days_since = (datetime.now() - datetime.strptime(last_scraped, "%Y-%m-%d")).days
+            except ValueError:
+                days_since = 30
+        else:
+            days_since = 999  # Jamais scrapée = priorité maximale
+
+        # Bonus pour les villes jamais scrapées
+        freshness_bonus = 100 if total_runs == 0 else 0
+        score = (days_since * avg_yield) + freshness_bonus
+
+        scored.append({
+            "city": city,
+            "score": score,
+            "days_since": days_since,
+            "avg_yield": avg_yield,
+            "total_runs": total_runs,
+            "is_idf": city.lower() in idf_set,
+        })
+
+    # Trier par score décroissant
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # Sélectionner en respectant la contrainte IDF
+    selected = []
+    idf_count = 0
+    for item in scored:
+        if len(selected) >= batch_size:
+            break
+        if item["is_idf"]:
+            if idf_count >= MAX_IDF_PER_BATCH:
+                continue
+            idf_count += 1
+        selected.append(item["city"])
+
+    log.info(f"🗺️  Rotation: {len(selected)} villes sélectionnées pour aujourd'hui")
+    log.info(f"    IDF: {idf_count} | Province: {len(selected) - idf_count}")
+    new_cities = [s for s in selected if state.get(s, {}).get("total_runs", 0) == 0]
+    if new_cities:
+        log.info(f"    🆕 Nouvelles villes (jamais scrapées): {len(new_cities)}")
+
+    return selected
+
+
+def update_rotation_state(city: str, prospects_count: int):
+    """Met à jour l'état de rotation après le scrape d'une ville."""
+    state = load_rotation_state()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    city_state = state.get(city, {
+        "last_scraped": "",
+        "avg_yield": 0,
+        "total_runs": 0,
+        "total_prospects": 0,
+        "history": [],
+    })
+
+    city_state["last_scraped"] = today_str
+    city_state["total_runs"] = city_state.get("total_runs", 0) + 1
+    city_state["total_prospects"] = city_state.get("total_prospects", 0) + prospects_count
+
+    # Historique glissant (garder les 10 derniers runs)
+    history = city_state.get("history", [])
+    history.append({"date": today_str, "prospects": prospects_count})
+    city_state["history"] = history[-10:]
+
+    # Recalculer le rendement moyen sur les derniers runs
+    if city_state["history"]:
+        city_state["avg_yield"] = sum(h["prospects"] for h in city_state["history"]) / len(city_state["history"])
+
+    state[city] = city_state
+    save_rotation_state(state)
+
+
+async def run_daily(
+    max_pages: int = 5,
+    dry_run: bool = False,
+    output_dir: str = ".",
+    batch_size: int = DAILY_CITY_BATCH,
+    target_prospects: int = 0,
+) -> dict:
+    """
+    Run quotidien automatique : sélectionne les villes par rotation et lance le pipeline.
+    Si target_prospects > 0, s'arrête quand le volume cible est atteint.
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    log.info(f"{'═'*60}")
+    log.info(f"  🇫🇷 RUN QUOTIDIEN — TOUTE LA FRANCE — {today_str}")
+    log.info(f"  Pool total: {len(ALL_CITIES_FRANCE)} villes")
+    log.info(f"  Batch: {batch_size} villes | Mode: {'DRY RUN' if dry_run else 'PRODUCTION'}")
+    if target_prospects:
+        log.info(f"  Objectif: {target_prospects} prospects")
+    log.info(f"{'═'*60}")
+
+    cities = pick_daily_cities(batch_size=batch_size)
+
+    if not cities:
+        log.warning("Aucune ville à scraper aujourd'hui (toutes déjà faites)")
+        return {"status": "no_cities", "date": today_str}
+
+    results = []
+    total_prospects = 0
+    cities_processed = 0
+    cities_with_results = 0
+
+    for i, city in enumerate(cities):
+        log.info(f"\n{'─'*50}")
+        log.info(f"  [{i+1}/{len(cities)}] {city}")
+        log.info(f"{'─'*50}")
+
+        try:
+            report = await run(
+                city=city,
+                max_pages=max_pages,
+                dry_run=dry_run,
+                output_dir=output_dir,
+            )
+
+            prospects_count = 0
+            if report and isinstance(report, dict):
+                meta = report.get("metadata", {})
+                prospects_count = meta.get("priority_1_count", 0) + meta.get("priority_2_count", 0)
+
+            update_rotation_state(city, prospects_count)
+
+            results.append({
+                "city": city,
+                "status": "success",
+                "prospects": prospects_count,
+            })
+
+            total_prospects += prospects_count
+            cities_processed += 1
+            if prospects_count > 0:
+                cities_with_results += 1
+
+            log.info(f"  ✅ {city}: {prospects_count} prospects ({total_prospects} total)")
+
+            # Arrêt anticipé si objectif atteint
+            if target_prospects and total_prospects >= target_prospects:
+                log.info(f"\n🎯 Objectif atteint ({total_prospects}/{target_prospects}) — arrêt anticipé")
+                break
+
+        except Exception as e:
+            log.error(f"  ❌ {city}: {e}")
+            update_rotation_state(city, 0)
+            results.append({
+                "city": city,
+                "status": "error",
+                "error": str(e),
+                "prospects": 0,
+            })
+            cities_processed += 1
+
+    # Résumé final
+    summary = {
+        "status": "completed",
+        "date": today_str,
+        "cities_selected": len(cities),
+        "cities_processed": cities_processed,
+        "cities_with_results": cities_with_results,
+        "total_prospects": total_prospects,
+        "avg_per_city": round(total_prospects / max(cities_processed, 1), 1),
+        "results": results,
+    }
+
+    log.info(f"\n{'═'*60}")
+    log.info(f"  📊 RÉSUMÉ RUN QUOTIDIEN — {today_str}")
+    log.info(f"{'═'*60}")
+    log.info(f"  Villes traitées: {cities_processed}/{len(cities)}")
+    log.info(f"  Villes productives: {cities_with_results}")
+    log.info(f"  Total prospects: {total_prospects}")
+    log.info(f"  Moyenne/ville: {summary['avg_per_city']}")
+    log.info(f"{'═'*60}")
+
+    # Sauvegarder le résumé
+    summary_path = Path(output_dir) / f"daily_summary_{today_str}.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info(f"📁 Résumé sauvegardé: {summary_path}")
+
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description="Orchestrateur Easydentist Doctolib → Sellsy")
     parser.add_argument("--city", type=str, help="Ville cible (ex: Paris, Marseille)")
     parser.add_argument("--cities-file", type=str, help="Fichier texte avec une ville par ligne")
+    parser.add_argument("--daily", action="store_true", help="Run quotidien automatique (rotation toute la France)")
+    parser.add_argument("--batch-size", type=int, default=DAILY_CITY_BATCH, help=f"Nombre de villes par run daily (défaut: {DAILY_CITY_BATCH})")
+    parser.add_argument("--target", type=int, default=0, help="Objectif de prospects (arrêt anticipé si atteint)")
     parser.add_argument("--max-pages", type=int, default=5, help="Nombre max de pages Doctolib par ville")
     parser.add_argument("--dry-run", action="store_true", help="Ne rien créer dans Sellsy")
     parser.add_argument("--output-dir", type=str, default=".", help="Dossier de sortie pour les rapports")
 
     args = parser.parse_args()
 
-    if not args.city and not args.cities_file:
-        parser.error("Spécifier --city ou --cities-file")
-
-    cities = []
-    if args.city:
-        cities = [args.city]
-    elif args.cities_file:
-        with open(args.cities_file) as f:
-            cities = [line.strip() for line in f if line.strip()]
-
-    for city in cities:
-        asyncio.run(run(
-            city=city,
+    if args.daily:
+        asyncio.run(run_daily(
             max_pages=args.max_pages,
             dry_run=args.dry_run,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            target_prospects=args.target,
         ))
+    elif args.city or args.cities_file:
+        cities = []
+        if args.city:
+            cities = [args.city]
+        elif args.cities_file:
+            with open(args.cities_file) as f:
+                cities = [line.strip() for line in f if line.strip()]
+
+        for city in cities:
+            asyncio.run(run(
+                city=city,
+                max_pages=args.max_pages,
+                dry_run=args.dry_run,
+                output_dir=args.output_dir
+            ))
+    else:
+        parser.error("Spécifier --city, --cities-file ou --daily")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ app = Flask(__name__)
 tasks_status = {
     "enrich": {"running": False, "last_run": None, "last_result": None},
     "orchestrator": {"running": False, "last_run": None, "last_result": None},
+    "daily": {"running": False, "last_run": None, "last_result": None},
     "extract_phones": {"running": False, "last_run": None, "last_result": None},
     "extract_emails": {"running": False, "last_run": None, "last_result": None},
     "extract_cabinet_name": {"running": False, "last_run": None, "last_result": None},
@@ -125,6 +126,57 @@ def trigger_orchestrator():
         "status": "started",
         "message": f"Orchestrateur lancé (city={city}, max_pages={max_pages}, dry_run={dry_run})",
         "timestamp": datetime.now().isoformat(),
+    }), 200
+
+
+@app.route("/trigger/daily", methods=["POST", "GET"])
+def trigger_daily():
+    """Lance le run quotidien automatique: rotation intelligente sur toute la France."""
+    if tasks_status["daily"]["running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "Le run quotidien est déjà en cours",
+            "started_at": tasks_status["daily"]["last_run"],
+        }), 409
+
+    # Paramètres
+    max_pages = int(request.args.get("max_pages", 5))
+    dry_run = request.args.get("dry_run", "false").lower() == "true"
+    batch_size = int(request.args.get("batch_size", 30))
+    target = int(request.args.get("target", 0))
+
+    from orchestrator import run_daily
+
+    run_async_in_thread(
+        run_daily,
+        "daily",
+        max_pages=max_pages,
+        dry_run=dry_run,
+        output_dir=".",
+        batch_size=batch_size,
+        target_prospects=target,
+    )
+
+    return jsonify({
+        "status": "started",
+        "message": f"Run quotidien lancé (batch={batch_size}, max_pages={max_pages}, target={target}, dry_run={dry_run})",
+        "timestamp": datetime.now().isoformat(),
+    }), 200
+
+
+@app.route("/rotation-state", methods=["GET"])
+def rotation_state():
+    """Retourne l'état de rotation des villes."""
+    from orchestrator import load_rotation_state, ALL_CITIES_FRANCE
+    state = load_rotation_state()
+    total = len(ALL_CITIES_FRANCE)
+    scraped = len([c for c in ALL_CITIES_FRANCE if c in state])
+    never = len([c for c in ALL_CITIES_FRANCE if c not in state])
+    return jsonify({
+        "total_cities": total,
+        "cities_scraped_at_least_once": scraped,
+        "cities_never_scraped": never,
+        "state": state,
     }), 200
 
 
@@ -243,14 +295,15 @@ def index():
     return jsonify({
         "service": "Easydentist Pipeline — Railway",
         "endpoints": {
+            "/trigger/daily": "POST/GET — 🇫🇷 Run quotidien rotation toute la France",
+            "/trigger/daily?batch_size=30&max_pages=5&target=100&dry_run=false": "Params daily",
+            "/trigger/orchestrator": "POST/GET — Pipeline pour UNE ville",
+            "/trigger/orchestrator?city=Paris&max_pages=5&dry_run=false": "Params orchestrator",
             "/trigger/enrich": "POST/GET — Enrichissement Est/Pas sur Doctolib",
-            "/trigger/enrich?batch_size=200&concurrency=10&force=false&browser=false": "Params",
-            "/trigger/orchestrator": "POST/GET — Pipeline complet Doctolib → Sellsy",
-            "/trigger/orchestrator?city=Paris&max_pages=5&dry_run=false": "Params",
+            "/trigger/extract-phones": "POST/GET — Extraction téléphones Doctolib",
             "/trigger/extract-emails": "POST/GET — Extraction emails Doctolib",
-            "/trigger/extract-emails?batch_size=100&concurrency=3&force=false": "Params",
-            "/trigger/extract-cabinet-name": "POST/GET — Extraction noms établissements Doctolib",
-            "/trigger/extract-cabinet-name?batch_size=100&concurrency=3&force=false": "Params",
+            "/trigger/extract-cabinet-name": "POST/GET — Extraction noms établissements",
+            "/rotation-state": "GET — État de rotation des villes",
             "/status": "GET — État des tâches",
             "/health": "GET — Health check",
         },
