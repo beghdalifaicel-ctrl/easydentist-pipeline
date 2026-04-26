@@ -96,6 +96,9 @@ def trigger_enrich():
     }), 200
 
 
+ALLOWED_SPECIALTIES = {"dentiste", "chirurgien-dentiste", "medecin-esthetique", "radiologue"}
+
+
 @app.route("/trigger/orchestrator", methods=["POST", "GET"])
 def trigger_orchestrator():
     """Lance le pipeline complet: scrape Doctolib → qualify → Sellsy."""
@@ -110,6 +113,14 @@ def trigger_orchestrator():
     city = request.args.get("city", "Paris")
     max_pages = int(request.args.get("max_pages", 5))
     dry_run = request.args.get("dry_run", "false").lower() == "true"
+    specialty = request.args.get("specialty", "dentiste").strip().lower()
+
+    # Validation: la spécialité doit correspondre exactement à un slug Doctolib connu
+    if specialty not in ALLOWED_SPECIALTIES:
+        return jsonify({
+            "status": "error",
+            "message": f"specialty invalide: '{specialty}'. Valeurs acceptées: {sorted(ALLOWED_SPECIALTIES)}",
+        }), 400
 
     from orchestrator import run as orchestrator_run
 
@@ -120,11 +131,12 @@ def trigger_orchestrator():
         max_pages=max_pages,
         dry_run=dry_run,
         output_dir=".",
+        specialty=specialty,
     )
 
     return jsonify({
         "status": "started",
-        "message": f"Orchestrateur lancé (city={city}, max_pages={max_pages}, dry_run={dry_run})",
+        "message": f"Orchestrateur lancé (city={city}, specialty={specialty}, max_pages={max_pages}, dry_run={dry_run})",
         "timestamp": datetime.now().isoformat(),
     }), 200
 
@@ -297,8 +309,8 @@ def index():
         "endpoints": {
             "/trigger/daily": "POST/GET — 🇫🇷 Run quotidien rotation toute la France",
             "/trigger/daily?batch_size=30&max_pages=5&target=100&dry_run=false": "Params daily",
-            "/trigger/orchestrator": "POST/GET — Pipeline pour UNE ville",
-            "/trigger/orchestrator?city=Paris&max_pages=5&dry_run=false": "Params orchestrator",
+            "/trigger/orchestrator": "POST/GET — Pipeline pour UNE ville (et UNE spécialité Doctolib)",
+            "/trigger/orchestrator?city=Paris&specialty=dentiste&max_pages=5&dry_run=false": "Params orchestrator. specialty ∈ {dentiste, chirurgien-dentiste, medecin-esthetique, radiologue}",
             "/trigger/enrich": "POST/GET — Enrichissement Est/Pas sur Doctolib",
             "/trigger/extract-phones": "POST/GET — Extraction téléphones Doctolib",
             "/trigger/extract-emails": "POST/GET — Extraction emails Doctolib",

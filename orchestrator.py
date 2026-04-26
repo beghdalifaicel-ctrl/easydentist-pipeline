@@ -153,14 +153,19 @@ log = logging.getLogger("orchestrator")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 JS_EXTRACT_DENTISTS = """
-() => {
+(specialty) => {
+    const sp = specialty || 'dentiste';
     const results = [];
     const cards = document.querySelectorAll('.dl-card-content');
     cards.forEach(card => {
         const text = (card.innerText || '').trim();
         if (!text.includes('Dr') && !text.includes('Cabinet') && !text.includes('Centre')) return;
 
-        const link = card.querySelector('a[href*="/dentiste/"]') || card.querySelector('a[href*="/chirurgien-dentiste/"]');
+        // Match the link by specialty slug; accept the chirurgien-dentiste alias when specialty=dentiste.
+        let link = card.querySelector('a[href*="/' + sp + '/"]');
+        if (!link && sp === 'dentiste') {
+            link = card.querySelector('a[href*="/chirurgien-dentiste/"]');
+        }
         if (!link) return;
 
         const href = link.getAttribute('href').split('?')[0];
@@ -288,7 +293,7 @@ JS_CHECK_HAS_NEXT_PAGE = """
 """
 
 
-async def _scrape_pages(browser, url_base: str, city: str, max_pages: int, date_label: str) -> list[dict]:
+async def _scrape_pages(browser, url_base: str, city: str, max_pages: int, date_label: str, specialty: str = "dentiste") -> list[dict]:
     """Scrape les pages de résultats Doctolib pour une URL de base donnée."""
     dentists = []
     for page_num in range(1, max_pages + 1):
@@ -313,9 +318,9 @@ async def _scrape_pages(browser, url_base: str, city: str, max_pages: int, date_
             await page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(1)
 
-            # Extraire les dentistes
-            page_dentists = await page.evaluate(JS_EXTRACT_DENTISTS)
-            log.info(f"    → {len(page_dentists)} dentistes trouvés")
+            # Extraire les praticiens (selector adapté à la spécialité)
+            page_dentists = await page.evaluate(JS_EXTRACT_DENTISTS, specialty)
+            log.info(f"    → {len(page_dentists)} {specialty} trouvés")
 
             for d in page_dentists:
                 d["source_city"] = city
@@ -338,8 +343,8 @@ async def _scrape_pages(browser, url_base: str, city: str, max_pages: int, date_
     return dentists
 
 
-async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
-    """Scrape les dentistes avec dispo sur Doctolib pour une ville (7 jours glissants)."""
+async def scrape_doctolib_city(city: str, max_pages: int = 5, specialty: str = "dentiste") -> list[dict]:
+    """Scrape les praticiens (selon `specialty`) avec dispo sur Doctolib pour une ville (7 jours glissants)."""
     try:
         from playwright.async_api import async_playwright
     except ImportError:
@@ -347,7 +352,7 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
         return []
 
     city_slug = city.lower().replace(' ', '-').replace("'", "-")
-    url_base = f"https://www.doctolib.fr/dentiste/{city_slug}"
+    url_base = f"https://www.doctolib.fr/{specialty}/{city_slug}"
 
     # Calculer les deux fenêtres de dates pour couvrir 7 jours glissants
     today = datetime.now()
@@ -374,12 +379,12 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
         try:
             # Fenêtre 1: cette semaine (vue par défaut, depuis aujourd'hui)
             url_w1 = f"{url_base}?availability_date={today_str}"
-            w1_dentists = await _scrape_pages(browser, url_w1, city, max_pages, f"semaine1({today_str})")
+            w1_dentists = await _scrape_pages(browser, url_w1, city, max_pages, f"semaine1({today_str})", specialty=specialty)
             all_dentists.extend(w1_dentists)
 
             # Fenêtre 2: début semaine prochaine (pour couvrir les jours restants)
             url_w2 = f"{url_base}?availability_date={next_window_date}"
-            w2_dentists = await _scrape_pages(browser, url_w2, city, max_pages, f"semaine2({next_window_date})")
+            w2_dentists = await _scrape_pages(browser, url_w2, city, max_pages, f"semaine2({next_window_date})", specialty=specialty)
             all_dentists.extend(w2_dentists)
         finally:
             await browser.close()
@@ -402,7 +407,7 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5) -> list[dict]:
     # Filtrer: garder seulement ceux avec plus de 5 créneaux sur les 7 prochains jours
     MIN_SLOTS = int(os.getenv("MIN_SLOTS", "2"))
     with_slots = [d for d in unique if d.get("hasSlotsThisWeek") and d.get("timeSlotCount", 0) > MIN_SLOTS]
-    log.info(f"📊 {city}: {len(unique)} dentistes uniques, {len(with_slots)} avec >5 créneaux (7j glissants)")
+    log.info(f"📊 {city} ({specialty}): {len(unique)} praticiens uniques, {len(with_slots)} avec >{MIN_SLOTS} créneaux (7j glissants)")
 
     return with_slots
 
@@ -1248,7 +1253,7 @@ def phone_matches(phone: str, contact: dict) -> bool:
 # RAPPORT JSON
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_report(decisions: list[dict], city: str) -> dict:
+def generate_report(decisions: list[dict], city: str, specialty: str = "dentiste") -> dict:
     """Génère le rapport JSON final."""
     now = datetime.now()
     p1 = [d for d in decisions if d.get("priority") == 1]
@@ -1261,6 +1266,7 @@ def generate_report(decisions: list[dict], city: str) -> dict:
         "metadata": {
             "date": now.isoformat(),
             "city": city,
+            "specialty": specialty,
             "total_scraped": len(decisions),
             "priority_1_count": len(p1),
             "priority_2_count": len(p2),
@@ -1426,19 +1432,19 @@ def update_google_sheet(decisions: list[dict]):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: str = ".", global_seen_urls: set | None = None):
-    """Exécute le pipeline complet pour une ville."""
+async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: str = ".", global_seen_urls: set | None = None, specialty: str = "dentiste"):
+    """Exécute le pipeline complet pour une ville et une spécialité Doctolib donnée."""
     log.info(f"═══════════════════════════════════════════")
-    log.info(f"  ORCHESTRATEUR EASYDENTIST — {city.upper()}")
+    log.info(f"  ORCHESTRATEUR EASYDENTIST — {city.upper()} ({specialty})")
     log.info(f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     log.info(f"  Mode: {'DRY RUN' if dry_run else 'PRODUCTION'}")
     log.info(f"═══════════════════════════════════════════")
 
     # 1. Scraping Doctolib
-    dentists = await scrape_doctolib_city(city, max_pages=max_pages)
+    dentists = await scrape_doctolib_city(city, max_pages=max_pages, specialty=specialty)
 
     if not dentists:
-        log.warning(f"Aucun dentiste avec dispo trouvé à {city}")
+        log.warning(f"Aucun praticien ({specialty}) avec dispo trouvé à {city}")
         return
 
     # 1b. Vérifier si chaque dentiste est réellement inscrit sur Doctolib
@@ -1498,11 +1504,13 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
         await asyncio.sleep(0.3)
 
     # 4. Rapport
-    report = generate_report(decisions, city)
+    report = generate_report(decisions, city, specialty=specialty)
 
     # Sauvegarder
     date_str = datetime.now().strftime("%Y-%m-%d")
-    filename = f"doctolib_{city.lower().replace(' ', '_')}_{date_str}.json"
+    # Inclure la spécialité dans le nom de fichier pour ne pas écraser un autre run
+    specialty_tag = "" if specialty == "dentiste" else f"_{specialty}"
+    filename = f"doctolib_{city.lower().replace(' ', '_')}{specialty_tag}_{date_str}.json"
     filepath = Path(output_dir) / filename
     filepath.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     log.info(f"\n📁 Rapport sauvegardé: {filepath}")
