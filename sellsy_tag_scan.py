@@ -1,21 +1,19 @@
 """
-sellsy_tag_scan.py — Scan ciblé des prospects Sellsy taggés pour identifier
+sellsy_tag_scan.py — Scan ciblé des prospects Sellsy pour identifier
 les "fauteuils vides" (>= seuil de créneaux Doctolib sur N jours).
 
-Workflow :
-  1. Auth Sellsy v2 (OAuth client_credentials)
-  2. Pull les companies portant n'importe lequel des tags fournis (essaie 4 stratégies)
-  3. Pour chaque company avec un Site Internet Doctolib, hit /availabilities.json
-     via proxy Bright Data datacenter pour compter les créneaux sur N jours
-  4. Filtre : ne garder que celles avec count >= min_slots
-  5. Écrit un onglet GSheet `Fauteuils_Vides_<YYYY-MM-DD>` avec le résultat trié
-  6. Retourne un summary dict (à sérialiser pour /status)
+Deux modes d'entrée :
+  - tags=NAMES      : essaie 4 stratégies pour résoudre le filtre smart-tags
+  - sellsy_ids=IDS  : prend directement une liste d'IDs (POST body ou query)
+                      → bypass total du filtre Sellsy (mode debug/fallback)
 
-Usage Python (CLI) :
+Usage CLI :
     python sellsy_tag_scan.py --tags "new cab avril 26,new centre avril 26" --min-slots 5 --days 7
+    python sellsy_tag_scan.py --ids 46905613,46905614 --min-slots 5
 
-Usage via webhook :
-    POST /trigger/sellsy-tag-scan?tags=new+cab+avril+26,new+centre+avril+26&min_slots=5&days=7
+Usage webhook :
+    POST /trigger/sellsy-tag-scan?tags=new+cab+avril+26&min_slots=5&days=7
+    POST /trigger/sellsy-tag-scan?sellsy_ids=46905613,46905614&min_slots=5
 """
 
 from __future__ import annotations
@@ -36,7 +34,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Config ────────────────────────────────────────────────────────────────────
 SELLSY_API_URL = os.getenv("SELLSY_API_URL", "https://api.sellsy.com/v2")
 SELLSY_CLIENT_ID = os.getenv("SELLSY_CLIENT_ID", "")
 SELLSY_CLIENT_SECRET = os.getenv("SELLSY_CLIENT_SECRET", "")
@@ -56,12 +53,11 @@ DELAY_MAX = float(os.getenv("DELAY_MAX", "1.5"))
 
 
 class SellsySync:
-    """Mini client Sellsy sync."""
-
     def __init__(self):
         self.token = None
         self.token_expires = 0
         self.session = requests.Session()
+        self.debug_log = []  # accumule les essais pour debug
 
     def _ensure_token(self):
         if self.token and time.time() < self.token_expires - 60:
@@ -89,136 +85,8 @@ class SellsySync:
             "Content-Type": "application/json",
         }
 
-    # ── Stratégie A : filtre direct par noms de smart-tags ────────────────
-    def search_by_tag_names(self, tag_names):
-        """Tente le filtre `smart_tags` (par noms) sur /companies/search."""
-        self._ensure_token()
-        out = []
-        offset = 0
-        page_size = 100
-        while True:
-            resp = self.session.post(
-                f"{SELLSY_API_URL}/companies/search",
-                json={
-                    "filters": {"smart_tags": tag_names},
-                    "limit": page_size,
-                    "offset": offset,
-                },
-                headers=self.headers,
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                log.warning(f"  [A] smart_tags by name failed {resp.status_code}: {resp.text[:200]}")
-                return None  # signal échec → essayer stratégie B
-            data = resp.json().get("data", [])
-            if not data:
-                break
-            out.extend(data)
-            log.info(f"  [A] page offset={offset} -> +{len(data)} (cumul {len(out)})")
-            if len(data) < page_size:
-                break
-            offset += page_size
-            time.sleep(0.3)
-        return out
-
-    # ── Stratégie B : list smart-tags pour résoudre IDs puis filter par IDs ──
-    def list_smart_tags(self):
-        self._ensure_token()
-        out = []
-        offset = 0
-        for path in ("/smart-tags", "/tags"):  # essaie les 2 routes possibles
-            try:
-                resp = self.session.get(
-                    f"{SELLSY_API_URL}{path}",
-                    params={"limit": 200, "offset": 0},
-                    headers=self.headers,
-                    timeout=30,
-                )
-                if resp.status_code == 200:
-                    body = resp.json()
-                    arr = body.get("data") or body.get("smart_tags") or body.get("tags") or []
-                    if arr:
-                        log.info(f"  [B] {path} -> {len(arr)} tags trouvés")
-                        return arr
-            except Exception as e:
-                log.debug(f"  [B] {path} exception: {e}")
-        return []
-
-    def search_by_tag_ids(self, tag_ids):
-        if not tag_ids:
-            return None
-        self._ensure_token()
-        out = []
-        offset = 0
-        page_size = 100
-        while True:
-            resp = self.session.post(
-                f"{SELLSY_API_URL}/companies/search",
-                json={
-                    "filters": {"smart_tag_ids": tag_ids},
-                    "limit": page_size,
-                    "offset": offset,
-                },
-                headers=self.headers,
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                log.warning(f"  [B] smart_tag_ids failed {resp.status_code}: {resp.text[:200]}")
-                return None
-            data = resp.json().get("data", [])
-            if not data:
-                break
-            out.extend(data)
-            log.info(f"  [B] page offset={offset} -> +{len(data)} (cumul {len(out)})")
-            if len(data) < page_size:
-                break
-            offset += page_size
-            time.sleep(0.3)
-        return out
-
-    # ── Stratégie C : scan all + filter local sur smart_tags retournés ─────
-    def scan_all_and_filter(self, tag_names_lower):
-        """Dernier recours : pagine toutes les companies et filtre côté code."""
-        self._ensure_token()
-        out = []
-        offset = 0
-        page_size = 100
-        scanned = 0
-        while True:
-            resp = self.session.post(
-                f"{SELLSY_API_URL}/companies/search",
-                json={"limit": page_size, "offset": offset},
-                headers=self.headers,
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                log.error(f"  [C] scan_all failed {resp.status_code}: {resp.text[:200]}")
-                break
-            data = resp.json().get("data", [])
-            if not data:
-                break
-            scanned += len(data)
-            for c in data:
-                tags = c.get("smart_tags") or c.get("tags") or []
-                # peut être list de str ou list de dict {id,value}
-                names = []
-                for t in tags:
-                    if isinstance(t, str):
-                        names.append(t.strip().lower())
-                    elif isinstance(t, dict):
-                        names.append((t.get("value") or t.get("name") or "").strip().lower())
-                if any(n in tag_names_lower for n in names):
-                    out.append(c)
-            if scanned % 1000 == 0:
-                log.info(f"  [C] scanned {scanned} (matched cumul {len(out)})")
-            if len(data) < page_size:
-                break
-            offset += page_size
-            time.sleep(0.2)
-        log.info(f"  [C] scanned total {scanned}, matched {len(out)}")
-        return out
-
-    def get_company_full(self, company_id):
+    def get_company(self, company_id):
+        """GET /companies/{id} — récupère une fiche complète."""
         self._ensure_token()
         resp = self.session.get(
             f"{SELLSY_API_URL}/companies/{company_id}",
@@ -227,35 +95,94 @@ class SellsySync:
         )
         if resp.status_code != 200:
             return None
-        return resp.json().get("data") or resp.json()
+        body = resp.json()
+        return body.get("data") or body
 
+    def list_companies_paginated(self, page_size=100):
+        """GET /companies?order=created_at&direction=desc paginé. Yield les companies."""
+        self._ensure_token()
+        offset = 0
+        while True:
+            resp = self.session.get(
+                f"{SELLSY_API_URL}/companies",
+                params={
+                    "limit": page_size,
+                    "offset": offset,
+                    "order": "created_at",
+                    "direction": "desc",
+                },
+                headers=self.headers,
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                self.debug_log.append(f"GET /companies offset={offset} -> {resp.status_code}: {resp.text[:200]}")
+                break
+            body = resp.json()
+            data = body.get("data", []) or []
+            if not data:
+                break
+            for c in data:
+                yield c
+            if len(data) < page_size:
+                break
+            offset += page_size
+            time.sleep(0.2)
 
-def fetch_companies(sellsy, tag_names):
-    """Essaie 3 stratégies, retourne (companies, strategy_used)."""
-    # A. filter par noms direct
-    log.info("--- Strategy A : filter smart_tags by name ---")
-    res = sellsy.search_by_tag_names(tag_names)
-    if res is not None and len(res) > 0:
-        return res, "A_filter_by_name"
+    def search_filter_attempts(self, tag_names):
+        """Essaie plusieurs syntaxes de filtre smart-tags via POST /companies/search."""
+        self._ensure_token()
+        attempts = [
+            ("smart_tags_names", {"smart_tags": tag_names}),
+            ("smart_tags_objects", {"smart_tags": [{"value": n} for n in tag_names]}),
+            ("smartTags", {"smartTags": tag_names}),
+            ("tags", {"tags": tag_names}),
+        ]
+        for label, filter_body in attempts:
+            try:
+                resp = self.session.post(
+                    f"{SELLSY_API_URL}/companies/search",
+                    json={"filters": filter_body, "limit": 5},
+                    headers=self.headers,
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    body = resp.json()
+                    pagination = body.get("pagination", {})
+                    total = pagination.get("count") or pagination.get("total") or len(body.get("data", []))
+                    self.debug_log.append(f"  filter[{label}] HTTP200 total={total}")
+                    if total and total > 0 and total < 50000:  # vraisemblable
+                        return label, filter_body
+                else:
+                    self.debug_log.append(f"  filter[{label}] HTTP{resp.status_code}: {resp.text[:120]}")
+            except Exception as e:
+                self.debug_log.append(f"  filter[{label}] exception: {e}")
+        return None, None
 
-    # B. resolve IDs via /smart-tags then filter
-    log.info("--- Strategy B : resolve tag IDs then filter by IDs ---")
-    all_tags = sellsy.list_smart_tags()
-    wanted = {n.strip().lower() for n in tag_names}
-    ids = []
-    for t in all_tags:
-        name = (t.get("value") or t.get("name") or "").strip().lower()
-        if name in wanted:
-            ids.append(int(t["id"]))
-    if ids:
-        res = sellsy.search_by_tag_ids(ids)
-        if res is not None and len(res) > 0:
-            return res, f"B_by_ids:{ids}"
-
-    # C. scan all + filter local
-    log.info("--- Strategy C : scan all companies + filter local ---")
-    res = sellsy.scan_all_and_filter({n.strip().lower() for n in tag_names})
-    return res, "C_scan_all_filter_local"
+    def search_companies_with_filter(self, filter_body, page_size=100):
+        """Pagine /companies/search avec un filter qui marche."""
+        self._ensure_token()
+        out = []
+        offset = 0
+        while True:
+            resp = self.session.post(
+                f"{SELLSY_API_URL}/companies/search",
+                json={"filters": filter_body, "limit": page_size, "offset": offset},
+                headers=self.headers,
+                timeout=60,
+            )
+            if resp.status_code != 200:
+                self.debug_log.append(f"page offset={offset} HTTP{resp.status_code}: {resp.text[:200]}")
+                break
+            data = resp.json().get("data", []) or []
+            if not data:
+                break
+            out.extend(data)
+            log.info(f"  page offset={offset} -> +{len(data)} (cumul {len(out)})")
+            if len(data) < page_size:
+                break
+            offset += page_size
+            time.sleep(0.2)
+        return out
 
 
 def _doctolib_session():
@@ -310,7 +237,7 @@ def count_doctolib_slots(session, doctolib_url, days=7):
         return 0, "exception"
 
 
-def write_results_to_gsheet(rows, tag_names, qualified_only=True):
+def write_results_to_gsheet(rows, tag_names_or_ids):
     if not GOOGLE_SHEET_ID or not GOOGLE_REFRESH_TOKEN:
         log.warning("GSheet non configuré, skip write")
         return None
@@ -338,7 +265,7 @@ def write_results_to_gsheet(rows, tag_names, qualified_only=True):
     sheet = client.open_by_key(GOOGLE_SHEET_ID)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    ws_name = f"Fauteuils_Vides_{today}" if qualified_only else f"Scan_Brut_{today}"
+    ws_name = f"Fauteuils_Vides_{today}"
     try:
         existing = sheet.worksheet(ws_name)
         sheet.del_worksheet(existing)
@@ -366,7 +293,7 @@ def write_results_to_gsheet(rows, tag_names, qualified_only=True):
                 r.get("nb_creneaux", 0),
                 r.get("scrape_status") or "",
                 r.get("scrape_date") or "",
-                ",".join(tag_names),
+                ",".join(str(x) for x in tag_names_or_ids),
                 r.get("min_slots_threshold", 0),
             ]
             for r in rows
@@ -417,22 +344,7 @@ def _company_postal(company):
     return ""
 
 
-def run(tag_names, min_slots=5, days=7):
-    started_at = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== sellsy_tag_scan : tags={tag_names} min_slots={min_slots} days={days} ===")
-
-    sellsy = SellsySync()
-    companies, strategy = fetch_companies(sellsy, tag_names)
-    log.info(f"  Strategy used: {strategy} -> {len(companies)} companies")
-
-    if not companies:
-        return {
-            "error": "no_companies_found",
-            "strategy_tried": strategy,
-            "tag_names": tag_names,
-            "started_at": started_at,
-        }
-
+def _scrape_companies(companies, sellsy, min_slots, days):
     sess = _doctolib_session()
     results = []
     stats = {"ok": 0, "no_url": 0, "not_on_doctolib": 0, "no_motive": 0, "http_error": 0, "exception": 0}
@@ -440,17 +352,22 @@ def run(tag_names, min_slots=5, days=7):
     for i, c in enumerate(companies, 1):
         url = _company_doctolib_url(c)
         if not url:
-            full = sellsy.get_company_full(int(c["id"]))
+            full = sellsy.get_company(int(c["id"])) if c.get("id") else None
             url = _company_doctolib_url(full or {})
+            if full:
+                # enrichir c avec les détails de full pour ville/cp/tel
+                for k in ("name", "phone_number", "address", "billing_address"):
+                    if k not in c and k in full:
+                        c[k] = full[k]
 
         nb_slots, status = count_doctolib_slots(sess, url, days=days) if url else (0, "no_url")
         prefix = status.split(":", 1)[0]
         stats[prefix] = stats.get(prefix, 0) + 1
 
         results.append({
-            "sellsy_id": int(c["id"]),
+            "sellsy_id": int(c["id"]) if c.get("id") else None,
             "nom": c.get("name") or c.get("display_name") or "",
-            "tag": ",".join(tag_names),
+            "tag": c.get("_tag_label", ""),
             "ville": _company_city(c),
             "code_postal": _company_postal(c),
             "telephone": _company_phone(c),
@@ -467,44 +384,122 @@ def run(tag_names, min_slots=5, days=7):
 
         time.sleep(DELAY_MIN + (DELAY_MAX - DELAY_MIN) * 0.5)
 
+    return results, stats
+
+
+def run_with_ids(sellsy_ids, min_slots=5, days=7, label="ids"):
+    """Mode IDs : prend directement une liste d'IDs Sellsy, GET chaque fiche, scrape."""
+    started_at = datetime.now(timezone.utc).isoformat()
+    log.info(f"=== sellsy_tag_scan IDS mode : {len(sellsy_ids)} ids min_slots={min_slots} days={days} ===")
+
+    sellsy = SellsySync()
+    sellsy._ensure_token()
+    companies = []
+    for sid in sellsy_ids:
+        c = sellsy.get_company(int(sid))
+        if c:
+            c["_tag_label"] = label
+            companies.append(c)
+        else:
+            log.warning(f"  Sellsy id {sid} introuvable")
+    log.info(f"  {len(companies)} fiches récupérées sur {len(sellsy_ids)} demandées")
+
+    if not companies:
+        return {"error": "no_companies_resolved", "ids_count": len(sellsy_ids), "started_at": started_at}
+
+    results, stats = _scrape_companies(companies, sellsy, min_slots, days)
     qualified = sorted(
         [r for r in results if r["nb_creneaux"] >= min_slots],
-        key=lambda r: r["nb_creneaux"],
-        reverse=True,
+        key=lambda r: r["nb_creneaux"], reverse=True,
     )
-
-    ws_name = write_results_to_gsheet(qualified, tag_names)
-
-    summary = {
+    ws_name = write_results_to_gsheet(qualified, [label])
+    return {
         "started_at": started_at,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-        "tag_names": tag_names,
-        "strategy_used": strategy,
-        "total_companies": len(companies),
+        "mode": "ids",
+        "ids_count": len(sellsy_ids),
         "scraped": len(results),
         "qualified_over_threshold": len(qualified),
-        "min_slots": min_slots,
-        "days": days,
-        "stats": stats,
-        "gsheet_tab": ws_name,
+        "min_slots": min_slots, "days": days,
+        "stats": stats, "gsheet_tab": ws_name,
         "top10": [
             {"sellsy_id": r["sellsy_id"], "nom": r["nom"], "ville": r["ville"], "nb_creneaux": r["nb_creneaux"]}
             for r in qualified[:10]
         ],
     }
-    log.info(f"=== Termine : {len(qualified)} fauteuils vides identifies / {len(companies)} scannes ===")
-    return summary
+
+
+def run(tag_names, min_slots=5, days=7):
+    started_at = datetime.now(timezone.utc).isoformat()
+    log.info(f"=== sellsy_tag_scan TAGS mode : tags={tag_names} min_slots={min_slots} days={days} ===")
+
+    sellsy = SellsySync()
+    log.info("--- Probe : tester les syntaxes de filtre smart-tags ---")
+    label, filter_body = sellsy.search_filter_attempts(tag_names)
+    if not filter_body:
+        return {
+            "error": "no_working_filter_found",
+            "tag_names": tag_names,
+            "debug_log": sellsy.debug_log,
+            "hint": "Aucune syntaxe de filtre smart-tags ne marche. Utilise le mode `sellsy_ids=...` à la place. Récupère les IDs depuis l'export CSV Sellsy filtré par tag.",
+            "started_at": started_at,
+        }
+    log.info(f"  Filter qui marche : `{label}` -> {filter_body}")
+    companies = sellsy.search_companies_with_filter(filter_body)
+    log.info(f"  -> {len(companies)} companies")
+
+    if not companies:
+        return {
+            "error": "filter_works_but_no_results",
+            "tag_names": tag_names, "filter_used": filter_body,
+            "debug_log": sellsy.debug_log,
+            "started_at": started_at,
+        }
+
+    for c in companies:
+        c["_tag_label"] = ",".join(tag_names)
+
+    results, stats = _scrape_companies(companies, sellsy, min_slots, days)
+    qualified = sorted(
+        [r for r in results if r["nb_creneaux"] >= min_slots],
+        key=lambda r: r["nb_creneaux"], reverse=True,
+    )
+    ws_name = write_results_to_gsheet(qualified, tag_names)
+
+    return {
+        "started_at": started_at,
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "tags",
+        "tag_names": tag_names,
+        "filter_used": filter_body,
+        "total_companies": len(companies),
+        "scraped": len(results),
+        "qualified_over_threshold": len(qualified),
+        "min_slots": min_slots, "days": days,
+        "stats": stats, "gsheet_tab": ws_name,
+        "top10": [
+            {"sellsy_id": r["sellsy_id"], "nom": r["nom"], "ville": r["ville"], "nb_creneaux": r["nb_creneaux"]}
+            for r in qualified[:10]
+        ],
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tags", required=True, help="Smart-tag names, comma-separated")
+    parser.add_argument("--tags", help="Smart-tag names, comma-separated")
+    parser.add_argument("--ids", help="Sellsy company IDs, comma-separated")
     parser.add_argument("--min-slots", type=int, default=5)
     parser.add_argument("--days", type=int, default=7)
     args = parser.parse_args()
 
-    tag_names = [t.strip() for t in args.tags.split(",") if t.strip()]
-    summary = run(tag_names=tag_names, min_slots=args.min_slots, days=args.days)
+    if args.ids:
+        ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()]
+        summary = run_with_ids(ids, min_slots=args.min_slots, days=args.days)
+    elif args.tags:
+        tag_names = [t.strip() for t in args.tags.split(",") if t.strip()]
+        summary = run(tag_names=tag_names, min_slots=args.min_slots, days=args.days)
+    else:
+        parser.error("--tags ou --ids requis")
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
 
 

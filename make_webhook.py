@@ -332,29 +332,50 @@ def trigger_sellsy_tag_scan():
             "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
         }), 409
 
-    tags_param = request.args.get("tags", "") or (request.get_json(silent=True) or {}).get("tags", "")
+    body = request.get_json(silent=True) or {}
+    tags_param = request.args.get("tags", "") or body.get("tags", "")
+    ids_param = request.args.get("sellsy_ids", "") or body.get("sellsy_ids", "")
+
     if isinstance(tags_param, list):
         tag_names = [t.strip() for t in tags_param if t and str(t).strip()]
     else:
         tag_names = [t.strip() for t in str(tags_param).split(",") if t.strip()]
 
-    if not tag_names:
+    if isinstance(ids_param, list):
+        sellsy_ids = [int(x) for x in ids_param if x]
+    else:
+        sellsy_ids = [int(x.strip()) for x in str(ids_param).split(",") if x.strip()]
+
+    if not tag_names and not sellsy_ids:
         return jsonify({
             "status": "error",
-            "message": "param `tags` requis (ex: tags=new+cab+avril+26,new+centre+avril+26)"
+            "message": "param `tags` OU `sellsy_ids` requis"
         }), 400
 
     min_slots = int(request.args.get("min_slots", 5))
     days = int(request.args.get("days", 7))
 
-    from sellsy_tag_scan import run as scan_run
+    if sellsy_ids:
+        from sellsy_tag_scan import run_with_ids
+        label = ",".join(tag_names) if tag_names else "ids_batch"
+        run_sync_in_thread(run_with_ids, "sellsy_tag_scan",
+                           sellsy_ids=sellsy_ids, min_slots=min_slots, days=days, label=label)
+        return jsonify({
+            "status": "started",
+            "task": "sellsy_tag_scan",
+            "mode": "ids",
+            "params": {"ids_count": len(sellsy_ids), "min_slots": min_slots, "days": days, "label": label},
+            "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
+            "poll": "/status",
+        }), 202
 
+    from sellsy_tag_scan import run as scan_run
     run_sync_in_thread(scan_run, "sellsy_tag_scan",
                        tag_names=tag_names, min_slots=min_slots, days=days)
-
     return jsonify({
         "status": "started",
         "task": "sellsy_tag_scan",
+        "mode": "tags",
         "params": {"tag_names": tag_names, "min_slots": min_slots, "days": days},
         "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
         "poll": "/status",
