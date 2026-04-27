@@ -3,6 +3,7 @@ make_webhook.py — Serveur Flask exposant des webhooks pour Railway.
 Endpoints:
   /trigger/enrich    — Lance l'enrichissement Est/Pas sur Doctolib (bulk)
   /trigger/orchestrator — Lance le pipeline complet (scrape + qualify)
+  /trigger/sellsy-tag-scan — Scan dispo Doctolib pour prospects Sellsy taggés
   /status            — État des tâches en cours
   /health            — Health check Railway
 """
@@ -31,6 +32,7 @@ tasks_status = {
     "extract_phones": {"running": False, "last_run": None, "last_result": None},
     "extract_emails": {"running": False, "last_run": None, "last_result": None},
     "extract_cabinet_name": {"running": False, "last_run": None, "last_result": None},
+    "sellsy_tag_scan": {"running": False, "last_run": None, "last_result": None},
 }
 
 
@@ -47,6 +49,28 @@ def run_async_in_thread(coro_func, task_name, **kwargs):
             result = loop.run_until_complete(coro_func(**kwargs))
             tasks_status[task_name]["last_result"] = {"status": "success", "detail": str(result)}
             logger.info(f"[{task_name}] Terminé avec succès")
+        except Exception as e:
+            tb = traceback.format_exc()
+            tasks_status[task_name]["last_result"] = {"status": "error", "detail": str(e), "traceback": tb}
+            logger.error(f"[{task_name}] Erreur: {e}")
+            logger.error(f"[{task_name}] Traceback:\n{tb}")
+        finally:
+            tasks_status[task_name]["running"] = False
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+
+
+def run_sync_in_thread(fn, task_name, **kwargs):
+    """Lance une fonction sync dans un thread (pour modules non-async comme sellsy_tag_scan)."""
+    tasks_status[task_name]["running"] = True
+    tasks_status[task_name]["last_run"] = datetime.now().isoformat()
+
+    def target():
+        try:
+            result = fn(**kwargs)
+            tasks_status[task_name]["last_result"] = {"status": "success", "detail": result}
+            logger.info(f"[{task_name}] Termine avec succes")
         except Exception as e:
             tb = traceback.format_exc()
             tasks_status[task_name]["last_result"] = {"status": "error", "detail": str(e), "traceback": tb}
@@ -289,6 +313,54 @@ def trigger_extract_cabinet_name():
     }), 200
 
 
+@app.route("/trigger/sellsy-tag-scan", methods=["POST", "GET"])
+def trigger_sellsy_tag_scan():
+    """
+    Scrape les disponibilites Doctolib des prospects Sellsy portant les tags donnes.
+    Filtre ceux avec >= min_slots creneaux sur N jours, ecrit dans GSheet `Fauteuils_Vides_<date>`.
+
+    Query params :
+      - tags : noms des smart-tags Sellsy, separes par virgule
+               (ex: "new cab avril 26,new centre avril 26")
+      - min_slots : seuil minimum de creneaux (defaut 5)
+      - days : fenetre de jours a scanner (defaut 7)
+    """
+    if tasks_status["sellsy_tag_scan"]["running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "Un scan est deja en cours",
+            "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
+        }), 409
+
+    tags_param = request.args.get("tags", "") or (request.get_json(silent=True) or {}).get("tags", "")
+    if isinstance(tags_param, list):
+        tag_names = [t.strip() for t in tags_param if t and str(t).strip()]
+    else:
+        tag_names = [t.strip() for t in str(tags_param).split(",") if t.strip()]
+
+    if not tag_names:
+        return jsonify({
+            "status": "error",
+            "message": "param `tags` requis (ex: tags=new+cab+avril+26,new+centre+avril+26)"
+        }), 400
+
+    min_slots = int(request.args.get("min_slots", 5))
+    days = int(request.args.get("days", 7))
+
+    from sellsy_tag_scan import run as scan_run
+
+    run_sync_in_thread(scan_run, "sellsy_tag_scan",
+                       tag_names=tag_names, min_slots=min_slots, days=days)
+
+    return jsonify({
+        "status": "started",
+        "task": "sellsy_tag_scan",
+        "params": {"tag_names": tag_names, "min_slots": min_slots, "days": days},
+        "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
+        "poll": "/status",
+    }), 202
+
+
 @app.route("/status", methods=["GET"])
 def status():
     """État de toutes les tâches."""
@@ -315,6 +387,8 @@ def index():
             "/trigger/extract-phones": "POST/GET — Extraction téléphones Doctolib",
             "/trigger/extract-emails": "POST/GET — Extraction emails Doctolib",
             "/trigger/extract-cabinet-name": "POST/GET — Extraction noms établissements",
+            "/trigger/sellsy-tag-scan": "POST/GET — Scan dispo Doctolib pour prospects Sellsy taggés (fauteuils vides)",
+            "/trigger/sellsy-tag-scan?tags=new+cab+avril+26,new+centre+avril+26&min_slots=5&days=7": "Params sellsy-tag-scan",
             "/rotation-state": "GET — État de rotation des villes",
             "/status": "GET — État des tâches",
             "/health": "GET — Health check",
