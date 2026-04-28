@@ -2,18 +2,21 @@
 sellsy_tag_scan.py — Scan ciblé des prospects Sellsy pour identifier
 les "fauteuils vides" (>= seuil de créneaux Doctolib sur N jours).
 
-Deux modes d'entrée :
-  - tags=NAMES      : essaie 4 stratégies pour résoudre le filtre smart-tags
-  - sellsy_ids=IDS  : prend directement une liste d'IDs (POST body ou query)
-                      → bypass total du filtre Sellsy (mode debug/fallback)
+V4 — Utilise Playwright + Bright Data Browser API (CDP) pour rendre les pages SPA.
+Le HTML brut Doctolib n'expose plus practice_id ni visit_motive_ids depuis 2025
+→ obligatoire de rendre le JS pour extraire les slots.
+
+Modes :
+  - sellsy_ids=IDS  : prend une liste d'IDs Sellsy en input
+  - tags=NAMES      : tente le filtre smart-tags (probablement KO côté API v2)
 
 Usage CLI :
-    python sellsy_tag_scan.py --tags "new cab avril 26,new centre avril 26" --min-slots 5 --days 7
-    python sellsy_tag_scan.py --ids 46905613,46905614 --min-slots 5
+    python sellsy_tag_scan.py --ids 46905613,46905614 --min-slots 5 --days 7
 
 Usage webhook :
-    POST /trigger/sellsy-tag-scan?tags=new+cab+avril+26&min_slots=5&days=7
-    POST /trigger/sellsy-tag-scan?sellsy_ids=46905613,46905614&min_slots=5
+    POST /trigger/sellsy-tag-scan?sellsy_ids=46905613,46905614&min_slots=5&days=7
+    POST /trigger/sellsy-tag-scan
+      body: {"sellsy_ids":[...], "min_slots":5, "days":7, "label":"fauteuils_vides"}
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import time
 import json
 import logging
 import argparse
+import asyncio
 from datetime import datetime, timezone
 
 import requests
@@ -38,10 +42,10 @@ SELLSY_API_URL = os.getenv("SELLSY_API_URL", "https://api.sellsy.com/v2")
 SELLSY_CLIENT_ID = os.getenv("SELLSY_CLIENT_ID", "")
 SELLSY_CLIENT_SECRET = os.getenv("SELLSY_CLIENT_SECRET", "")
 
-BRIGHT_DATA_HOST = os.getenv("BRIGHT_DATA_HOST", "brd.superproxy.io")
-BRIGHT_DATA_PORT = os.getenv("BRIGHT_DATA_PORT", "33335")
-BRIGHT_DATA_USER = os.getenv("BRIGHT_DATA_USER", "")
-BRIGHT_DATA_PASS = os.getenv("BRIGHT_DATA_PASS", "")
+SBR_WS = os.getenv(
+    "BRIGHT_DATA_BROWSER_WS",
+    "wss://brd-customer-hl_dbe515e1-zone-doctolib_browser:ub9zsp721noa@brd.superproxy.io:9222"
+)
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -49,7 +53,74 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
 DELAY_MIN = float(os.getenv("DELAY_MIN", "0.5"))
-DELAY_MAX = float(os.getenv("DELAY_MAX", "1.5"))
+
+
+JS_COUNT_DOCTOLIB_SLOTS = r"""
+() => {
+    const body = (document.body && document.body.innerText) ? document.body.innerText : "";
+    const title = document.title || "";
+
+    // 1) Cas "pas sur Doctolib"
+    const notOnDoctolib = body.includes("n'est pas sur Doctolib")
+        || body.includes("n’est pas sur Doctolib")
+        || body.includes("Revendiquer mon profil")
+        || body.includes("pas réservable en ligne")
+        || body.includes("pas réservable en ligne");
+    if (notOnDoctolib) return {status: "not_on_doctolib", nb_slots: 0, mode: "negative_signal"};
+
+    // 2) Compter les boutons de créneau visibles dans le widget Doctolib
+    // Plusieurs sélecteurs car Doctolib change ses classes
+    const selectors = [
+        'button.availabilities-slot',
+        'button.dl-button-slot',
+        '[data-test="availability-slot"]',
+        'button[class*="slot"][class*="availability"]',
+        'button[class*="time-slot"]',
+        'a[href*="/booking/"]',
+    ];
+    let slot_count = 0;
+    let used_selector = null;
+    for (const sel of selectors) {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) {
+            // Filtrer les visibles
+            let visible = 0;
+            els.forEach(e => {
+                const r = e.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) visible++;
+            });
+            if (visible > 0) {
+                slot_count = visible;
+                used_selector = sel;
+                break;
+            }
+        }
+    }
+
+    if (slot_count > 0) {
+        return {status: "ok", nb_slots: slot_count, mode: "dom_count", selector: used_selector};
+    }
+
+    // 3) Fallback texte : "Aucune disponibilité"
+    if (body.match(/Aucune disponibilit[eé]/i)) {
+        return {status: "ok", nb_slots: 0, mode: "text_no_avail"};
+    }
+
+    // 4) Fallback : "Prochain rendez-vous : <date>" → on a au moins 1 slot, mais on retourne 1
+    //    (impossible de savoir le nb exact sans cliquer sur un motif)
+    const m = body.match(/Prochain (?:rendez-vous|RDV)\s*:?\s*([A-Za-zéè]+\s+\d+\s+[a-zéû]+)/i);
+    if (m) {
+        return {status: "ok", nb_slots: 1, mode: "text_proximate", date: m[1]};
+    }
+
+    // 5) Si on a au moins un mot-clé Doctolib mais pas de slots détectés → 0
+    if (body.includes("Prendre rendez-vous") || body.includes("Prenez RDV")) {
+        return {status: "ok", nb_slots: 0, mode: "registered_no_slots"};
+    }
+
+    return {status: "no_data", nb_slots: 0, mode: "unknown", title_snip: title.slice(0, 60)};
+}
+"""
 
 
 class SellsySync:
@@ -57,7 +128,6 @@ class SellsySync:
         self.token = None
         self.token_expires = 0
         self.session = requests.Session()
-        self.debug_log = []  # accumule les essais pour debug
 
     def _ensure_token(self):
         if self.token and time.time() < self.token_expires - 60:
@@ -80,228 +150,17 @@ class SellsySync:
 
     @property
     def headers(self):
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
+        return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
     def get_company(self, company_id):
-        """GET /companies/{id} — récupère une fiche complète."""
         self._ensure_token()
         resp = self.session.get(
-            f"{SELLSY_API_URL}/companies/{company_id}",
-            headers=self.headers,
-            timeout=30,
+            f"{SELLSY_API_URL}/companies/{company_id}", headers=self.headers, timeout=30,
         )
         if resp.status_code != 200:
             return None
         body = resp.json()
         return body.get("data") or body
-
-    def list_companies_paginated(self, page_size=100):
-        """GET /companies?order=created_at&direction=desc paginé. Yield les companies."""
-        self._ensure_token()
-        offset = 0
-        while True:
-            resp = self.session.get(
-                f"{SELLSY_API_URL}/companies",
-                params={
-                    "limit": page_size,
-                    "offset": offset,
-                    "order": "created_at",
-                    "direction": "desc",
-                },
-                headers=self.headers,
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                self.debug_log.append(f"GET /companies offset={offset} -> {resp.status_code}: {resp.text[:200]}")
-                break
-            body = resp.json()
-            data = body.get("data", []) or []
-            if not data:
-                break
-            for c in data:
-                yield c
-            if len(data) < page_size:
-                break
-            offset += page_size
-            time.sleep(0.2)
-
-    def search_filter_attempts(self, tag_names):
-        """Essaie plusieurs syntaxes de filtre smart-tags via POST /companies/search."""
-        self._ensure_token()
-        attempts = [
-            ("smart_tags_names", {"smart_tags": tag_names}),
-            ("smart_tags_objects", {"smart_tags": [{"value": n} for n in tag_names]}),
-            ("smartTags", {"smartTags": tag_names}),
-            ("tags", {"tags": tag_names}),
-        ]
-        for label, filter_body in attempts:
-            try:
-                resp = self.session.post(
-                    f"{SELLSY_API_URL}/companies/search",
-                    json={"filters": filter_body, "limit": 5},
-                    headers=self.headers,
-                    timeout=30,
-                )
-                if resp.status_code == 200:
-                    body = resp.json()
-                    pagination = body.get("pagination", {})
-                    total = pagination.get("count") or pagination.get("total") or len(body.get("data", []))
-                    self.debug_log.append(f"  filter[{label}] HTTP200 total={total}")
-                    if total and total > 0 and total < 50000:  # vraisemblable
-                        return label, filter_body
-                else:
-                    self.debug_log.append(f"  filter[{label}] HTTP{resp.status_code}: {resp.text[:120]}")
-            except Exception as e:
-                self.debug_log.append(f"  filter[{label}] exception: {e}")
-        return None, None
-
-    def search_companies_with_filter(self, filter_body, page_size=100):
-        """Pagine /companies/search avec un filter qui marche."""
-        self._ensure_token()
-        out = []
-        offset = 0
-        while True:
-            resp = self.session.post(
-                f"{SELLSY_API_URL}/companies/search",
-                json={"filters": filter_body, "limit": page_size, "offset": offset},
-                headers=self.headers,
-                timeout=60,
-            )
-            if resp.status_code != 200:
-                self.debug_log.append(f"page offset={offset} HTTP{resp.status_code}: {resp.text[:200]}")
-                break
-            data = resp.json().get("data", []) or []
-            if not data:
-                break
-            out.extend(data)
-            log.info(f"  page offset={offset} -> +{len(data)} (cumul {len(out)})")
-            if len(data) < page_size:
-                break
-            offset += page_size
-            time.sleep(0.2)
-        return out
-
-
-def _doctolib_session():
-    s = requests.Session()
-    proxy = f"http://{BRIGHT_DATA_USER}:{BRIGHT_DATA_PASS}@{BRIGHT_DATA_HOST}:{BRIGHT_DATA_PORT}"
-    s.proxies = {"http": proxy, "https": proxy}
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json,text/html",
-        "Accept-Language": "fr-FR,fr;q=0.9",
-    })
-    return s
-
-
-def count_doctolib_slots(session, doctolib_url, days=7):
-    if not doctolib_url or "doctolib" not in (doctolib_url or "").lower():
-        return 0, "no_url"
-    try:
-        resp = session.get(doctolib_url, timeout=30)
-        if resp.status_code == 404:
-            return 0, "not_on_doctolib"
-        resp.raise_for_status()
-        html = resp.text
-
-        m_practice = re.search(r'"practice_ids":\[(\d+)', html)
-        m_motive = re.search(r'"visit_motive_ids":\[([^\]]+)\]', html)
-        if not m_practice or not m_motive:
-            has_text = re.search(r"(Prochain rendez-vous|Prochaine disponibilit)", html, re.I)
-            return (1 if has_text else 0), "no_motive"
-
-        practice_id = m_practice.group(1)
-        first_motive = m_motive.group(1).split(",")[0].strip()
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        url_avail = (
-            f"https://www.doctolib.fr/availabilities.json"
-            f"?start_date={today}"
-            f"&visit_motive_ids={first_motive}"
-            f"&practice_ids={practice_id}"
-            f"&limit={days}"
-        )
-        r2 = session.get(url_avail, timeout=30)
-        if r2.status_code != 200:
-            return 0, f"http_error:{r2.status_code}"
-        data = r2.json()
-        availabilities = data.get("availabilities", []) or []
-        total = sum(len(d.get("slots", []) or []) for d in availabilities)
-        return total, "ok"
-    except requests.RequestException:
-        return 0, "exception"
-    except Exception:
-        return 0, "exception"
-
-
-def write_results_to_gsheet(rows, tag_names_or_ids):
-    if not GOOGLE_SHEET_ID or not GOOGLE_REFRESH_TOKEN:
-        log.warning("GSheet non configuré, skip write")
-        return None
-    try:
-        import gspread
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request as GRequest
-    except ImportError:
-        log.warning("gspread non installé, skip write")
-        return None
-
-    creds = Credentials(
-        token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        token_uri="https://oauth2.googleapis.com/token",
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    creds.refresh(GRequest())
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(GOOGLE_SHEET_ID)
-
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    ws_name = f"Fauteuils_Vides_{today}"
-    try:
-        existing = sheet.worksheet(ws_name)
-        sheet.del_worksheet(existing)
-    except Exception:
-        pass
-    ws = sheet.add_worksheet(title=ws_name, rows=max(len(rows) + 5, 100), cols=12)
-
-    headers = [
-        "sellsy_id", "nom", "tag", "ville", "code_postal",
-        "telephone", "doctolib_url", "nb_creneaux_7j", "scrape_status",
-        "scrape_date", "tags_query", "min_slots_threshold",
-    ]
-    ws.update("A1", [headers])
-
-    if rows:
-        values = [
-            [
-                r.get("sellsy_id"),
-                r.get("nom") or "",
-                r.get("tag") or "",
-                r.get("ville") or "",
-                r.get("code_postal") or "",
-                r.get("telephone") or "",
-                r.get("doctolib_url") or "",
-                r.get("nb_creneaux", 0),
-                r.get("scrape_status") or "",
-                r.get("scrape_date") or "",
-                ",".join(str(x) for x in tag_names_or_ids),
-                r.get("min_slots_threshold", 0),
-            ]
-            for r in rows
-        ]
-        ws.update("A2", values, value_input_option="USER_ENTERED")
-
-    log.info(f"GSheet : onglet `{ws_name}` ecrit ({len(rows)} lignes)")
-    return ws_name
 
 
 def _company_doctolib_url(company):
@@ -344,79 +203,203 @@ def _company_postal(company):
     return ""
 
 
-def _scrape_companies(companies, sellsy, min_slots, days):
-    sess = _doctolib_session()
+async def _scrape_with_browser(companies, min_slots):
+    """Lance Chromium via Bright Data Browser et scrape chaque URL Doctolib."""
+    from playwright.async_api import async_playwright
+
     results = []
-    stats = {"ok": 0, "no_url": 0, "not_on_doctolib": 0, "no_motive": 0, "http_error": 0, "exception": 0}
+    stats = {"ok": 0, "no_url": 0, "not_on_doctolib": 0, "no_data": 0, "exception": 0}
 
-    for i, c in enumerate(companies, 1):
-        url = _company_doctolib_url(c)
-        if not url:
-            full = sellsy.get_company(int(c["id"])) if c.get("id") else None
-            url = _company_doctolib_url(full or {})
-            if full:
-                # enrichir c avec les détails de full pour ville/cp/tel
-                for k in ("name", "phone_number", "address", "billing_address"):
-                    if k not in c and k in full:
-                        c[k] = full[k]
+    async with async_playwright() as pw:
+        try:
+            browser = await pw.chromium.connect_over_cdp(SBR_WS, timeout=60_000)
+        except Exception as e:
+            log.error(f"Connexion Bright Data Browser impossible: {e}")
+            return results, stats
 
-        nb_slots, status = count_doctolib_slots(sess, url, days=days) if url else (0, "no_url")
-        prefix = status.split(":", 1)[0]
-        stats[prefix] = stats.get(prefix, 0) + 1
+        try:
+            page = await browser.new_page()
 
-        results.append({
-            "sellsy_id": int(c["id"]) if c.get("id") else None,
-            "nom": c.get("name") or c.get("display_name") or "",
-            "tag": c.get("_tag_label", ""),
-            "ville": _company_city(c),
-            "code_postal": _company_postal(c),
-            "telephone": _company_phone(c),
-            "doctolib_url": url,
-            "nb_creneaux": nb_slots,
-            "scrape_status": status,
-            "scrape_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-            "min_slots_threshold": min_slots,
-        })
+            for i, c in enumerate(companies, 1):
+                url = _company_doctolib_url(c)
+                if not url:
+                    results.append({
+                        "sellsy_id": int(c["id"]) if c.get("id") else None,
+                        "nom": c.get("name") or "",
+                        "tag": c.get("_tag_label", ""),
+                        "ville": _company_city(c),
+                        "code_postal": _company_postal(c),
+                        "telephone": _company_phone(c),
+                        "doctolib_url": "",
+                        "nb_creneaux": 0,
+                        "scrape_status": "no_url",
+                        "scrape_mode": "",
+                        "scrape_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "min_slots_threshold": min_slots,
+                    })
+                    stats["no_url"] += 1
+                    continue
 
-        if i % 50 == 0:
-            qcount = sum(1 for r in results if r["nb_creneaux"] >= min_slots)
-            log.info(f"  [{i}/{len(companies)}] cumul : ok={stats['ok']} >=seuil={qcount}")
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    # Attendre le rendu React + le widget de booking
+                    await page.wait_for_timeout(5000)
+                    # Scroll léger pour trigger les chargements lazy
+                    try:
+                        await page.evaluate("window.scrollBy(0, 600)")
+                        await page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
 
-        time.sleep(DELAY_MIN + (DELAY_MAX - DELAY_MIN) * 0.5)
+                    res = await page.evaluate(JS_COUNT_DOCTOLIB_SLOTS)
+                    status = res.get("status") or "no_data"
+                    nb = int(res.get("nb_slots") or 0)
+                    mode = res.get("mode") or ""
+
+                    stats[status if status in stats else "no_data"] = stats.get(status, 0) + 1
+                    results.append({
+                        "sellsy_id": int(c["id"]) if c.get("id") else None,
+                        "nom": c.get("name") or "",
+                        "tag": c.get("_tag_label", ""),
+                        "ville": _company_city(c),
+                        "code_postal": _company_postal(c),
+                        "telephone": _company_phone(c),
+                        "doctolib_url": url,
+                        "nb_creneaux": nb,
+                        "scrape_status": status,
+                        "scrape_mode": mode,
+                        "scrape_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "min_slots_threshold": min_slots,
+                    })
+                except Exception as e:
+                    stats["exception"] += 1
+                    results.append({
+                        "sellsy_id": int(c["id"]) if c.get("id") else None,
+                        "nom": c.get("name") or "",
+                        "tag": c.get("_tag_label", ""),
+                        "ville": _company_city(c),
+                        "code_postal": _company_postal(c),
+                        "telephone": _company_phone(c),
+                        "doctolib_url": url,
+                        "nb_creneaux": 0,
+                        "scrape_status": "exception",
+                        "scrape_mode": str(e)[:100],
+                        "scrape_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "min_slots_threshold": min_slots,
+                    })
+
+                if i % 20 == 0:
+                    qcount = sum(1 for r in results if r["nb_creneaux"] >= min_slots)
+                    log.info(f"  [{i}/{len(companies)}] ok={stats['ok']} excep={stats['exception']} >=seuil={qcount}")
+
+                await page.wait_for_timeout(int(DELAY_MIN * 1000))
+
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     return results, stats
 
 
+def write_results_to_gsheet(rows, label):
+    if not GOOGLE_SHEET_ID or not GOOGLE_REFRESH_TOKEN:
+        log.warning("GSheet non configuré, skip write")
+        return None
+    try:
+        import gspread
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request as GRequest
+    except ImportError:
+        log.warning("gspread non installé, skip write")
+        return None
+
+    creds = Credentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    creds.refresh(GRequest())
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(GOOGLE_SHEET_ID)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ws_name = f"Fauteuils_Vides_{today}"
+    try:
+        existing = sheet.worksheet(ws_name)
+        sheet.del_worksheet(existing)
+    except Exception:
+        pass
+    ws = sheet.add_worksheet(title=ws_name, rows=max(len(rows) + 5, 100), cols=12)
+
+    headers = [
+        "sellsy_id", "nom", "tag", "ville", "code_postal", "telephone",
+        "doctolib_url", "nb_creneaux", "scrape_status", "scrape_mode",
+        "scrape_date", "min_slots_threshold",
+    ]
+    ws.update("A1", [headers])
+
+    if rows:
+        values = [
+            [
+                r.get("sellsy_id"), r.get("nom") or "", r.get("tag") or "",
+                r.get("ville") or "", r.get("code_postal") or "", r.get("telephone") or "",
+                r.get("doctolib_url") or "", r.get("nb_creneaux", 0),
+                r.get("scrape_status") or "", r.get("scrape_mode") or "",
+                r.get("scrape_date") or "", r.get("min_slots_threshold", 0),
+            ]
+            for r in rows
+        ]
+        ws.update("A2", values, value_input_option="USER_ENTERED")
+
+    log.info(f"GSheet : onglet `{ws_name}` ecrit ({len(rows)} lignes)")
+    return ws_name
+
+
 def run_with_ids(sellsy_ids, min_slots=5, days=7, label="ids"):
-    """Mode IDs : prend directement une liste d'IDs Sellsy, GET chaque fiche, scrape."""
     started_at = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== sellsy_tag_scan IDS mode : {len(sellsy_ids)} ids min_slots={min_slots} days={days} ===")
+    log.info(f"=== sellsy_tag_scan PLAYWRIGHT IDS mode : {len(sellsy_ids)} ids min_slots={min_slots} days={days} ===")
 
     sellsy = SellsySync()
     sellsy._ensure_token()
     companies = []
-    for sid in sellsy_ids:
+    for i, sid in enumerate(sellsy_ids, 1):
         c = sellsy.get_company(int(sid))
         if c:
             c["_tag_label"] = label
             companies.append(c)
-        else:
-            log.warning(f"  Sellsy id {sid} introuvable")
+        if i % 200 == 0:
+            log.info(f"  Sellsy fetch [{i}/{len(sellsy_ids)}]")
     log.info(f"  {len(companies)} fiches récupérées sur {len(sellsy_ids)} demandées")
 
     if not companies:
         return {"error": "no_companies_resolved", "ids_count": len(sellsy_ids), "started_at": started_at}
 
-    results, stats = _scrape_companies(companies, sellsy, min_slots, days)
+    # Lancer le scraping browser dans un event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        results, stats = loop.run_until_complete(_scrape_with_browser(companies, min_slots))
+    finally:
+        loop.close()
+
     qualified = sorted(
         [r for r in results if r["nb_creneaux"] >= min_slots],
         key=lambda r: r["nb_creneaux"], reverse=True,
     )
-    ws_name = write_results_to_gsheet(qualified, [label])
+    ws_name = write_results_to_gsheet(qualified, label)
+
     return {
         "started_at": started_at,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "ids",
+        "mode": "ids_playwright",
         "ids_count": len(sellsy_ids),
         "scraped": len(results),
         "qualified_over_threshold": len(qualified),
@@ -430,71 +413,26 @@ def run_with_ids(sellsy_ids, min_slots=5, days=7, label="ids"):
 
 
 def run(tag_names, min_slots=5, days=7):
-    started_at = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== sellsy_tag_scan TAGS mode : tags={tag_names} min_slots={min_slots} days={days} ===")
-
-    sellsy = SellsySync()
-    log.info("--- Probe : tester les syntaxes de filtre smart-tags ---")
-    label, filter_body = sellsy.search_filter_attempts(tag_names)
-    if not filter_body:
-        return {
-            "error": "no_working_filter_found",
-            "tag_names": tag_names,
-            "debug_log": sellsy.debug_log,
-            "hint": "Aucune syntaxe de filtre smart-tags ne marche. Utilise le mode `sellsy_ids=...` à la place. Récupère les IDs depuis l'export CSV Sellsy filtré par tag.",
-            "started_at": started_at,
-        }
-    log.info(f"  Filter qui marche : `{label}` -> {filter_body}")
-    companies = sellsy.search_companies_with_filter(filter_body)
-    log.info(f"  -> {len(companies)} companies")
-
-    if not companies:
-        return {
-            "error": "filter_works_but_no_results",
-            "tag_names": tag_names, "filter_used": filter_body,
-            "debug_log": sellsy.debug_log,
-            "started_at": started_at,
-        }
-
-    for c in companies:
-        c["_tag_label"] = ",".join(tag_names)
-
-    results, stats = _scrape_companies(companies, sellsy, min_slots, days)
-    qualified = sorted(
-        [r for r in results if r["nb_creneaux"] >= min_slots],
-        key=lambda r: r["nb_creneaux"], reverse=True,
-    )
-    ws_name = write_results_to_gsheet(qualified, tag_names)
-
+    """Mode tags : on ne sait pas filtrer par tag via API v2 — retourne erreur explicite."""
     return {
-        "started_at": started_at,
-        "ended_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "tags",
+        "error": "filter_by_smart_tags_unsupported_api_v2",
+        "hint": "Utilise le mode `sellsy_ids=...` à la place. Récupère les IDs depuis l'export CSV Sellsy filtré par tag (Actions > Export CSV > format import).",
         "tag_names": tag_names,
-        "filter_used": filter_body,
-        "total_companies": len(companies),
-        "scraped": len(results),
-        "qualified_over_threshold": len(qualified),
-        "min_slots": min_slots, "days": days,
-        "stats": stats, "gsheet_tab": ws_name,
-        "top10": [
-            {"sellsy_id": r["sellsy_id"], "nom": r["nom"], "ville": r["ville"], "nb_creneaux": r["nb_creneaux"]}
-            for r in qualified[:10]
-        ],
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tags", help="Smart-tag names, comma-separated")
+    parser.add_argument("--tags", help="Smart-tag names (mode non supporté actuellement)")
     parser.add_argument("--ids", help="Sellsy company IDs, comma-separated")
     parser.add_argument("--min-slots", type=int, default=5)
     parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--label", default="ids_batch")
     args = parser.parse_args()
 
     if args.ids:
         ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()]
-        summary = run_with_ids(ids, min_slots=args.min_slots, days=args.days)
+        summary = run_with_ids(ids, min_slots=args.min_slots, days=args.days, label=args.label)
     elif args.tags:
         tag_names = [t.strip() for t in args.tags.split(",") if t.strip()]
         summary = run(tag_names=tag_names, min_slots=args.min_slots, days=args.days)
