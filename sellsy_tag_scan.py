@@ -2,10 +2,13 @@
 sellsy_tag_scan.py — Scan ciblé des prospects Sellsy pour identifier
 les "fauteuils vides" (>= seuil de créneaux Doctolib sur N jours).
 
-V5 — Playwright + Bright Data Browser CDP, robuste :
-  - Try/except par URL (1 fail ne tue plus le scan)
-  - Reconnexion browser tous les BROWSER_REFRESH_EVERY prospects
-  - Checkpoint progressif dans GSheet (perd plus rien en cas de crash)
+V6 — Playwright + Bright Data Browser CDP, intercepte XHR /availabilities.json :
+  - Le React app Doctolib appelle TOUJOURS /availabilities.json quand on charge
+    la page d'un praticien. On écoute les responses réseau et on lit le JSON
+    directement (pas de parse DOM, pas de clics requis).
+  - Si la page est un centre multi-praticien (sans motive par défaut),
+    on tente de cliquer le 1er praticien puis le 1er motive.
+  - Try/except par URL, reconnect browser tous les 50 prospects, checkpoint GSheet.
 """
 
 from __future__ import annotations
@@ -40,58 +43,10 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
-# Reconnect browser every N prospects to avoid Bright Data session timeouts
 BROWSER_REFRESH_EVERY = int(os.getenv("BROWSER_REFRESH_EVERY", "50"))
-# Flush checkpoint to GSheet every N prospects
 CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50"))
-
-
-JS_COUNT_DOCTOLIB_SLOTS = r"""
-() => {
-    const body = (document.body && document.body.innerText) ? document.body.innerText : "";
-    const title = document.title || "";
-
-    const notOnDoctolib = body.includes("n'est pas sur Doctolib")
-        || body.includes("n’est pas sur Doctolib")
-        || body.includes("Revendiquer mon profil")
-        || body.includes("pas réservable en ligne");
-    if (notOnDoctolib) return {status: "not_on_doctolib", nb_slots: 0, mode: "negative_signal"};
-
-    const selectors = [
-        'button.availabilities-slot',
-        'button.dl-button-slot',
-        '[data-test="availability-slot"]',
-        'button[class*="slot"][class*="availability"]',
-        'button[class*="time-slot"]',
-        'a[href*="/booking/"]',
-    ];
-    let slot_count = 0;
-    let used_selector = null;
-    for (const sel of selectors) {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) {
-            let visible = 0;
-            els.forEach(e => {
-                const r = e.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) visible++;
-            });
-            if (visible > 0) { slot_count = visible; used_selector = sel; break; }
-        }
-    }
-    if (slot_count > 0) return {status: "ok", nb_slots: slot_count, mode: "dom_count", selector: used_selector};
-
-    if (body.match(/Aucune disponibilit[eé]/i)) return {status: "ok", nb_slots: 0, mode: "text_no_avail"};
-
-    const m = body.match(/Prochain (?:rendez-vous|RDV)\s*:?\s*([A-Za-zéè]+\s+\d+\s+[a-zéû]+)/i);
-    if (m) return {status: "ok", nb_slots: 1, mode: "text_proximate", date: m[1]};
-
-    if (body.includes("Prendre rendez-vous") || body.includes("Prenez RDV")) {
-        return {status: "ok", nb_slots: 0, mode: "registered_no_slots"};
-    }
-
-    return {status: "no_data", nb_slots: 0, mode: "unknown", title_snip: title.slice(0, 60)};
-}
-"""
+PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "30000"))
+WAIT_AFTER_LOAD_MS = int(os.getenv("WAIT_AFTER_LOAD_MS", "8000"))
 
 
 class SellsySync:
@@ -124,8 +79,7 @@ class SellsySync:
         try:
             r = self.session.get(f"{SELLSY_API_URL}/companies/{company_id}",
                                  headers=self.headers, timeout=30)
-            if r.status_code != 200:
-                return None
+            if r.status_code != 200: return None
             b = r.json()
             return b.get("data") or b
         except Exception:
@@ -135,14 +89,12 @@ class SellsySync:
 def _company_doctolib_url(company):
     for k in ("website", "web", "site_web", "url"):
         v = (company or {}).get(k)
-        if v and "doctolib" in str(v).lower():
-            return str(v)
+        if v and "doctolib" in str(v).lower(): return str(v)
     for nk in ("contact_information", "informations"):
         nest = (company or {}).get(nk) or {}
         for k in ("website", "web"):
             v = nest.get(k)
-            if v and "doctolib" in str(v).lower():
-                return str(v)
+            if v and "doctolib" in str(v).lower(): return str(v)
     return ""
 
 
@@ -186,10 +138,8 @@ def _row_for_company(c, url, nb, status, mode, min_slots):
     }
 
 
-# ─── GSheet checkpoint ────────────────────────────────────────────────────────
 def _gsheet_open():
-    if not GOOGLE_SHEET_ID or not GOOGLE_REFRESH_TOKEN:
-        return None
+    if not GOOGLE_SHEET_ID or not GOOGLE_REFRESH_TOKEN: return None
     try:
         import gspread
         from google.oauth2.credentials import Credentials
@@ -226,14 +176,11 @@ def _gsheet_init_tab(sheet, ws_name):
 
 
 def _gsheet_append_rows(ws, rows):
-    """Append batch of rows to gsheet."""
-    if not rows:
-        return
+    if not rows: return
     values = [[r.get(h) for h in GSHEET_HEADERS] for r in rows]
     ws.append_rows(values, value_input_option="USER_ENTERED")
 
 
-# ─── Sellsy fetch (phase 1) ───────────────────────────────────────────────────
 def fetch_companies(sellsy, sellsy_ids, label):
     log.info(f"=== Phase 1 : Fetch {len(sellsy_ids)} fiches Sellsy ===")
     sellsy._ensure_token()
@@ -249,17 +196,120 @@ def fetch_companies(sellsy, sellsy_ids, label):
     return companies
 
 
-# ─── Browser scraping with reconnect (phase 2) ────────────────────────────────
+# ─── Browser scraping with availability XHR interception ──────────────────────
 async def _new_browser_page(pw):
     browser = await pw.chromium.connect_over_cdp(SBR_WS, timeout=60_000)
     page = await browser.new_page()
     return browser, page
 
 
+async def _scrape_one_url(page, url, days):
+    """Charge la page, écoute les XHR /availabilities.json, retourne (nb_slots, status, mode).
+
+    Stratégie :
+    1. Set up listener pour capturer toutes les responses /availabilities.json
+    2. page.goto(url) → React app charge et fait son XHR auto
+    3. Attendre WAIT_AFTER_LOAD_MS pour laisser les XHR se déclencher
+    4. Si aucun XHR détecté, essayer de cliquer 1er praticien + 1er motive (centres)
+    5. Compter les slots dans le JSON capturé
+    """
+    captured = []  # list of availability JSONs
+
+    async def handle_response(response):
+        try:
+            u = response.url
+            if "availabilities.json" in u or "/availabilities/" in u:
+                ct = response.headers.get("content-type", "")
+                if "json" in ct.lower():
+                    try:
+                        data = await response.json()
+                        captured.append(data)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    page.on("response", handle_response)
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+    except Exception as e:
+        return 0, "exception", f"goto:{type(e).__name__}"
+
+    await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+
+    # Si pas de XHR encore, peut-être que c'est un centre multi-praticien — tenter clic
+    if not captured:
+        try:
+            # Cliquer le 1er bouton de praticien (différents sélecteurs possibles)
+            for sel in [
+                'button[data-test*="practitioner"]',
+                'a[href*="/dentiste/"]',
+                'a[href*="/chirurgien-dentiste/"]',
+                'div.dl-card[role="button"]',
+                'button.profile-button',
+            ]:
+                el = await page.query_selector(sel)
+                if el:
+                    try:
+                        await el.click(timeout=3000)
+                        await page.wait_for_timeout(3000)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    if not captured:
+        try:
+            for sel in [
+                'button[data-test*="visit-motive"]',
+                'button[class*="motive"]',
+                'div[role="button"][class*="motive"]',
+                'button.dl-button-primary',
+            ]:
+                el = await page.query_selector(sel)
+                if el:
+                    try:
+                        await el.click(timeout=3000)
+                        await page.wait_for_timeout(4000)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # Si toujours rien, fallback sur DOM count
+    if not captured:
+        try:
+            body_text = await page.evaluate("() => document.body.innerText || ''")
+            if "n'est pas sur Doctolib" in body_text or "Revendiquer mon profil" in body_text:
+                return 0, "not_on_doctolib", "negative_signal"
+            if "Aucune disponibilit" in body_text or "Pas de disponibilit" in body_text:
+                return 0, "ok", "text_no_avail"
+            return 0, "no_data", "no_xhr_no_clicks"
+        except Exception:
+            return 0, "no_data", "no_xhr"
+
+    # Compter les slots dans toutes les réponses capturées (sur N jours = days)
+    total_slots = 0
+    days_with_slots = 0
+    for data in captured:
+        if not isinstance(data, dict): continue
+        avail = data.get("availabilities", []) or []
+        for d in avail:
+            slots = d.get("slots", []) or []
+            if slots:
+                days_with_slots += 1
+                total_slots += len(slots)
+
+    return total_slots, "ok", f"xhr_capture:{len(captured)}resp_{days_with_slots}days"
+
+
 async def _scrape_with_browser_robust(companies, min_slots, ws, results_acc, stats):
     from playwright.async_api import async_playwright
 
-    pending_ckpt = []  # rows depuis le dernier checkpoint
+    pending_ckpt = []
     n = len(companies)
 
     async with async_playwright() as pw:
@@ -275,7 +325,6 @@ async def _scrape_with_browser_robust(companies, min_slots, ws, results_acc, sta
                 results_acc.append(row); pending_ckpt.append(row)
                 stats["no_url"] = stats.get("no_url", 0) + 1
             else:
-                # (Re)connect browser if needed
                 if browser is None or scraped_in_session >= BROWSER_REFRESH_EVERY:
                     if browser is not None:
                         try: await browser.close()
@@ -289,43 +338,29 @@ async def _scrape_with_browser_robust(companies, min_slots, ws, results_acc, sta
                         row = _row_for_company(c, url, 0, "exception", f"connect:{type(e).__name__}", min_slots)
                         results_acc.append(row); pending_ckpt.append(row)
                         stats["exception"] = stats.get("exception", 0) + 1
-                        # Wait + retry next iteration
                         await asyncio.sleep(5)
                         continue
 
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                    await page.wait_for_timeout(5000)
-                    try:
-                        await page.evaluate("window.scrollBy(0, 600)")
-                        await page.wait_for_timeout(1500)
-                    except Exception:
-                        pass
-
-                    res = await page.evaluate(JS_COUNT_DOCTOLIB_SLOTS)
-                    status = res.get("status") or "no_data"
-                    nb = int(res.get("nb_slots") or 0)
-                    mode = res.get("mode") or ""
+                    nb, status, mode = await _scrape_one_url(page, url, days=7)
                     if status not in stats: stats[status] = 0
                     stats[status] += 1
                     row = _row_for_company(c, url, nb, status, mode, min_slots)
                     results_acc.append(row); pending_ckpt.append(row)
                     scraped_in_session += 1
+                    if nb >= min_slots:
+                        log.info(f"  [{i}/{n}] ✓ FAUTEUIL VIDE: {row['nom'][:40]} {row['ville'][:20]} = {nb} créneaux")
                 except Exception as e:
                     err = type(e).__name__
                     log.warning(f"  [{i}/{n}] {url[:60]} -> {err}")
                     row = _row_for_company(c, url, 0, "exception", f"{err}:{str(e)[:80]}", min_slots)
                     results_acc.append(row); pending_ckpt.append(row)
                     stats["exception"] = stats.get("exception", 0) + 1
-                    # Browser may be dead → force reconnect next iter
                     try: await browser.close()
                     except Exception: pass
-                    browser = None
-                    page = None
-                    scraped_in_session = 0
+                    browser = None; page = None; scraped_in_session = 0
                     await asyncio.sleep(2)
 
-            # Checkpoint
             if ws is not None and len(pending_ckpt) >= CHECKPOINT_EVERY:
                 try:
                     _gsheet_append_rows(ws, pending_ckpt)
@@ -334,14 +369,12 @@ async def _scrape_with_browser_robust(companies, min_slots, ws, results_acc, sta
                 except Exception as e:
                     log.warning(f"  GSheet checkpoint failed: {e}")
 
-            # Periodic progress log
             if i % 25 == 0:
                 qcount = sum(1 for r in results_acc if r["nb_creneaux"] >= min_slots)
                 log.info(f"  [{i}/{n}] cumul stats={dict(stats)} >=seuil={qcount}")
 
             await asyncio.sleep(0.3)
 
-        # Final flush
         if ws is not None and pending_ckpt:
             try:
                 _gsheet_append_rows(ws, pending_ckpt)
@@ -354,23 +387,21 @@ async def _scrape_with_browser_robust(companies, min_slots, ws, results_acc, sta
             except Exception: pass
 
 
-# ─── Orchestrator ─────────────────────────────────────────────────────────────
 def run_with_ids(sellsy_ids, min_slots=5, days=7, label="ids"):
     started_at = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== sellsy_tag_scan v5 : {len(sellsy_ids)} ids min_slots={min_slots} ===")
+    log.info(f"=== sellsy_tag_scan v6 (XHR intercept) : {len(sellsy_ids)} ids min_slots={min_slots} ===")
 
     sellsy = SellsySync()
     companies = fetch_companies(sellsy, sellsy_ids, label)
     if not companies:
         return {"error": "no_companies_resolved", "ids_count": len(sellsy_ids), "started_at": started_at}
 
-    # Init GSheet tab for checkpointing
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     ws_name = f"Fauteuils_Vides_{today}"
     sheet = _gsheet_open()
     ws = _gsheet_init_tab(sheet, ws_name) if sheet else None
     if ws is None:
-        log.warning("GSheet indisponible → pas de checkpoint, résultat seulement en mémoire")
+        log.warning("GSheet indisponible → pas de checkpoint")
 
     results = []
     stats = {"ok": 0, "no_url": 0, "not_on_doctolib": 0, "no_data": 0, "exception": 0}
@@ -390,7 +421,7 @@ def run_with_ids(sellsy_ids, min_slots=5, days=7, label="ids"):
     return {
         "started_at": started_at,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "ids_playwright_v5",
+        "mode": "ids_playwright_v6_xhr",
         "ids_count": len(sellsy_ids),
         "scraped": len(results),
         "qualified_over_threshold": len(qualified),
