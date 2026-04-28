@@ -241,41 +241,41 @@ async def _scrape_one(page, profile_url, days):
         except Exception:
             return 0, "no_data", "no_redirect_no_body"
 
-    # On est sur /booking/motives → cliquer le 1er motif "consultation"
+    # On est sur /booking/motives → cliquer le 1er motif (v8 fix: bon filtre length + tri asc)
     if "/booking/motives" in cur_url:
-        clicked = False
+        clicked_label = None
         try:
-            # Chercher tous les liens/boutons des motifs
-            motive_text = await page.evaluate("""() => {
-                const els = Array.from(document.querySelectorAll('a, button, [role="button"], div[class*="motive"], li'));
-                return els.filter(e => {
-                    const t = (e.innerText || '').trim();
-                    if (t.length < 3 || t.length > 80) return false;
-                    return /consultation|soins|d.tartrage|premi.re|examen/i.test(t);
-                }).slice(0, 5).map(e => e.innerText.trim().slice(0, 60));
+            # v8 : filtre strict + tri par length pour prendre le BOUTON, pas un parent
+            clicked_label = await page.evaluate("""() => {
+                const candidates = Array.from(document.querySelectorAll('a, button, [role="button"], li[class*="motive"]'))
+                    .filter(e => {
+                        const t = (e.innerText || '').trim();
+                        if (t.length < 3 || t.length > 60) return false;
+                        return /consultation|soins|d.tartrage|premi.re|examen|d.brid/i.test(t);
+                    })
+                    .sort((a, b) => a.innerText.length - b.innerText.length);
+                if (candidates.length === 0) return null;
+                candidates[0].click();
+                return candidates[0].innerText.trim();
             }""")
+            if not clicked_label:
+                # Fallback : prendre n'importe quel bouton court (1er motif quel qu'il soit)
+                clicked_label = await page.evaluate("""() => {
+                    const candidates = Array.from(document.querySelectorAll('a, button'))
+                        .filter(e => {
+                            const t = (e.innerText || '').trim();
+                            return t.length > 3 && t.length < 60;
+                        })
+                        .sort((a, b) => a.innerText.length - b.innerText.length);
+                    // Skip headers/nav (souvent < 6 chars)
+                    const target = candidates.find(e => e.innerText.trim().length > 6);
+                    if (!target) return null;
+                    target.click();
+                    return target.innerText.trim();
+                }""")
 
-            # Cliquer le 1er motif qui matche un mot-clé prioritaire
-            for kw in MOTIVE_KEYWORDS:
-                clicked_attempt = await page.evaluate(f"""(() => {{
-                    const kw = "{kw}";
-                    const els = Array.from(document.querySelectorAll('a, button, [role="button"], div, li'));
-                    const target = els.find(e => {{
-                        const t = (e.innerText || '').toLowerCase().trim();
-                        return t.length > 2 && t.length < 100 && t.includes(kw);
-                    }});
-                    if (target) {{
-                        target.click();
-                        return target.innerText.trim().slice(0, 50);
-                    }}
-                    return null;
-                }})()""")
-                if clicked_attempt:
-                    clicked = True
-                    break
-
-            if not clicked:
-                return 0, "no_motives", f"no_match_kw"
+            if not clicked_label:
+                return 0, "no_motives", "no_button_found"
 
         except Exception as e:
             return 0, "exception", f"motive_click:{type(e).__name__}"
