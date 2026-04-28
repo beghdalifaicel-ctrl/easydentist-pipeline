@@ -2,51 +2,46 @@
 sellsy_tag_scan.py — Scan ciblé des prospects Sellsy pour identifier
 les "fauteuils vides" (>= seuil de créneaux Doctolib sur N jours).
 
-V6 — Playwright + Bright Data Browser CDP, intercepte XHR /availabilities.json :
-  - Le React app Doctolib appelle TOUJOURS /availabilities.json quand on charge
-    la page d'un praticien. On écoute les responses réseau et on lit le JSON
-    directement (pas de parse DOM, pas de clics requis).
-  - Si la page est un centre multi-praticien (sans motive par défaut),
-    on tente de cliquer le 1er praticien puis le 1er motive.
-  - Try/except par URL, reconnect browser tous les 50 prospects, checkpoint GSheet.
+V7 — Workflow réel Doctolib (booking + cliquer motif) :
+  1. Navigate vers URL_PROFIL/booking?source=profile
+     → redirige vers /booking/motives (résa active)
+     → ou retourne 404/page profil (résa inactive)
+  2. Si /booking/motives : cliquer le 1er motif "consultation"
+  3. Attendre 8s → intercepte les XHR /availabilities.json
+  4. Lit `total` du JSON pour le compte de slots sur 7 jours
+
+Statuts :
+  - ok           : XHR capturé, nb_creneaux = total
+  - no_booking   : redirige pas vers /motives → résa Doctolib désactivée
+  - no_motives   : page motives mais aucun motif clickable
+  - exception    : erreur réseau / timeout
 """
 
 from __future__ import annotations
 
-import os
-import json
-import time
-import logging
-import argparse
-import asyncio
+import os, json, time, logging, argparse, asyncio
 from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 SELLSY_API_URL = os.getenv("SELLSY_API_URL", "https://api.sellsy.com/v2")
 SELLSY_CLIENT_ID = os.getenv("SELLSY_CLIENT_ID", "")
 SELLSY_CLIENT_SECRET = os.getenv("SELLSY_CLIENT_SECRET", "")
-
-SBR_WS = os.getenv(
-    "BRIGHT_DATA_BROWSER_WS",
-    "wss://brd-customer-hl_dbe515e1-zone-doctolib_browser:ub9zsp721noa@brd.superproxy.io:9222"
-)
-
+SBR_WS = os.getenv("BRIGHT_DATA_BROWSER_WS",
+    "wss://brd-customer-hl_dbe515e1-zone-doctolib_browser:ub9zsp721noa@brd.superproxy.io:9222")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
-BROWSER_REFRESH_EVERY = int(os.getenv("BROWSER_REFRESH_EVERY", "50"))
-CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "50"))
+BROWSER_REFRESH_EVERY = int(os.getenv("BROWSER_REFRESH_EVERY", "30"))
+CHECKPOINT_EVERY = int(os.getenv("CHECKPOINT_EVERY", "25"))
 PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "30000"))
-WAIT_AFTER_LOAD_MS = int(os.getenv("WAIT_AFTER_LOAD_MS", "8000"))
 
 
 class SellsySync:
@@ -56,16 +51,12 @@ class SellsySync:
         self.session = requests.Session()
 
     def _ensure_token(self):
-        if self.token and time.time() < self.token_expires - 60:
-            return
-        resp = self.session.post(
-            "https://login.sellsy.com/oauth2/access-tokens",
-            json={"grant_type": "client_credentials",
-                  "client_id": SELLSY_CLIENT_ID, "client_secret": SELLSY_CLIENT_SECRET},
-            headers={"Content-Type": "application/json"}, timeout=30,
-        )
-        resp.raise_for_status()
-        d = resp.json()
+        if self.token and time.time() < self.token_expires - 60: return
+        r = self.session.post("https://login.sellsy.com/oauth2/access-tokens",
+            json={"grant_type":"client_credentials","client_id":SELLSY_CLIENT_ID,"client_secret":SELLSY_CLIENT_SECRET},
+            headers={"Content-Type":"application/json"}, timeout=30)
+        r.raise_for_status()
+        d = r.json()
         self.token = d["access_token"]
         self.token_expires = time.time() + d.get("expires_in", 3600)
         log.info("Sellsy token obtenu")
@@ -74,11 +65,10 @@ class SellsySync:
     def headers(self):
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
 
-    def get_company(self, company_id):
+    def get_company(self, cid):
         self._ensure_token()
         try:
-            r = self.session.get(f"{SELLSY_API_URL}/companies/{company_id}",
-                                 headers=self.headers, timeout=30)
+            r = self.session.get(f"{SELLSY_API_URL}/companies/{cid}", headers=self.headers, timeout=30)
             if r.status_code != 200: return None
             b = r.json()
             return b.get("data") or b
@@ -86,49 +76,49 @@ class SellsySync:
             return None
 
 
-def _company_doctolib_url(company):
+def _doctolib_url(c):
     for k in ("website", "web", "site_web", "url"):
-        v = (company or {}).get(k)
+        v = (c or {}).get(k)
         if v and "doctolib" in str(v).lower(): return str(v)
     for nk in ("contact_information", "informations"):
-        nest = (company or {}).get(nk) or {}
+        nest = (c or {}).get(nk) or {}
         for k in ("website", "web"):
             v = nest.get(k)
             if v and "doctolib" in str(v).lower(): return str(v)
     return ""
 
 
-def _company_phone(c):
-    for k in ("phone_number", "phone", "tel", "mobile"):
+def _phone(c):
+    for k in ("phone_number","phone","tel","mobile"):
         v = (c or {}).get(k)
         if v: return str(v)
     return ""
 
 
-def _company_city(c):
-    for n in ("address", "billing_address", "primary_address"):
+def _city(c):
+    for n in ("address","billing_address","primary_address"):
         a = (c or {}).get(n) or {}
         v = a.get("city") or a.get("ville")
         if v: return str(v)
     return ""
 
 
-def _company_postal(c):
-    for n in ("address", "billing_address", "primary_address"):
+def _postal(c):
+    for n in ("address","billing_address","primary_address"):
         a = (c or {}).get(n) or {}
         v = a.get("postal_code") or a.get("zipcode") or a.get("zip_code")
         if v: return str(v)
     return ""
 
 
-def _row_for_company(c, url, nb, status, mode, min_slots):
+def _row(c, url, nb, status, mode, min_slots):
     return {
         "sellsy_id": int(c["id"]) if c.get("id") else None,
         "nom": c.get("name") or c.get("display_name") or "",
-        "tag": c.get("_tag_label", ""),
-        "ville": _company_city(c),
-        "code_postal": _company_postal(c),
-        "telephone": _company_phone(c),
+        "tag": c.get("_tag_label",""),
+        "ville": _city(c),
+        "code_postal": _postal(c),
+        "telephone": _phone(c),
         "doctolib_url": url or "",
         "nb_creneaux": int(nb or 0),
         "scrape_status": status or "",
@@ -146,79 +136,70 @@ def _gsheet_open():
         from google.auth.transport.requests import Request as GRequest
     except ImportError:
         return None
-    creds = Credentials(
-        token=None, refresh_token=GOOGLE_REFRESH_TOKEN,
+    creds = Credentials(token=None, refresh_token=GOOGLE_REFRESH_TOKEN,
         client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET,
         token_uri="https://oauth2.googleapis.com/token",
-        scopes=["https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"],
-    )
+        scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
     creds.refresh(GRequest())
     return gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
 
 
-GSHEET_HEADERS = [
-    "sellsy_id", "nom", "tag", "ville", "code_postal", "telephone",
-    "doctolib_url", "nb_creneaux", "scrape_status", "scrape_mode",
-    "scrape_date", "min_slots_threshold",
-]
+GHEADERS = ["sellsy_id","nom","tag","ville","code_postal","telephone","doctolib_url",
+            "nb_creneaux","scrape_status","scrape_mode","scrape_date","min_slots_threshold"]
 
 
-def _gsheet_init_tab(sheet, ws_name):
+def _gsheet_init(sheet, name):
     try:
-        existing = sheet.worksheet(ws_name)
-        sheet.del_worksheet(existing)
+        ex = sheet.worksheet(name)
+        sheet.del_worksheet(ex)
     except Exception:
         pass
-    ws = sheet.add_worksheet(title=ws_name, rows=5000, cols=12)
-    ws.update("A1", [GSHEET_HEADERS])
+    ws = sheet.add_worksheet(title=name, rows=5000, cols=12)
+    ws.update("A1", [GHEADERS])
     return ws
 
 
-def _gsheet_append_rows(ws, rows):
+def _gsheet_append(ws, rows):
     if not rows: return
-    values = [[r.get(h) for h in GSHEET_HEADERS] for r in rows]
-    ws.append_rows(values, value_input_option="USER_ENTERED")
+    ws.append_rows([[r.get(h) for h in GHEADERS] for r in rows], value_input_option="USER_ENTERED")
 
 
-def fetch_companies(sellsy, sellsy_ids, label):
-    log.info(f"=== Phase 1 : Fetch {len(sellsy_ids)} fiches Sellsy ===")
+def fetch_companies(sellsy, ids, label):
+    log.info(f"=== Phase 1 : Fetch {len(ids)} fiches Sellsy ===")
     sellsy._ensure_token()
-    companies = []
-    for i, sid in enumerate(sellsy_ids, 1):
+    out = []
+    for i, sid in enumerate(ids, 1):
         c = sellsy.get_company(int(sid))
         if c:
             c["_tag_label"] = label
-            companies.append(c)
+            out.append(c)
         if i % 200 == 0:
-            log.info(f"  Sellsy fetch [{i}/{len(sellsy_ids)}] (got {len(companies)} valid)")
-    log.info(f"=== Phase 1 done : {len(companies)} fiches récupérées ===")
-    return companies
+            log.info(f"  Sellsy fetch [{i}/{len(ids)}] (got {len(out)})")
+    log.info(f"=== Phase 1 done : {len(out)} fiches ===")
+    return out
 
 
-# ─── Browser scraping with availability XHR interception ──────────────────────
-async def _new_browser_page(pw):
-    browser = await pw.chromium.connect_over_cdp(SBR_WS, timeout=60_000)
-    page = await browser.new_page()
-    return browser, page
+# Mots-clés pour identifier le motif "consultation" (à cliquer en priorité)
+MOTIVE_KEYWORDS = [
+    "première consultation",
+    "premiere consultation",
+    "consultation dentaire",
+    "soins dentaires",
+    "détartrage",
+    "detartrage",
+    "consultation",
+    "soins",
+]
 
 
-async def _scrape_one_url(page, url, days):
-    """Charge la page, écoute les XHR /availabilities.json, retourne (nb_slots, status, mode).
-
-    Stratégie :
-    1. Set up listener pour capturer toutes les responses /availabilities.json
-    2. page.goto(url) → React app charge et fait son XHR auto
-    3. Attendre WAIT_AFTER_LOAD_MS pour laisser les XHR se déclencher
-    4. Si aucun XHR détecté, essayer de cliquer 1er praticien + 1er motive (centres)
-    5. Compter les slots dans le JSON capturé
-    """
-    captured = []  # list of availability JSONs
+async def _scrape_one(page, profile_url, days):
+    """Workflow Doctolib v7 : profile → /booking → motives → click → XHR.
+    Retourne (nb_slots, status, mode)."""
+    captured = []
 
     async def handle_response(response):
         try:
-            u = response.url
-            if "availabilities.json" in u or "/availabilities/" in u:
+            if "availabilities.json" in response.url:
                 ct = response.headers.get("content-type", "")
                 if "json" in ct.lower():
                     try:
@@ -231,156 +212,168 @@ async def _scrape_one_url(page, url, days):
 
     page.on("response", handle_response)
 
+    # Construire l'URL booking
+    base = profile_url.rstrip("/")
+    booking_url = base + "/booking?source=profile"
+
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        await page.goto(booking_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     except Exception as e:
         return 0, "exception", f"goto:{type(e).__name__}"
 
-    await page.wait_for_timeout(WAIT_AFTER_LOAD_MS)
+    await page.wait_for_timeout(4000)
 
-    # Si pas de XHR encore, peut-être que c'est un centre multi-praticien — tenter clic
-    if not captured:
-        try:
-            # Cliquer le 1er bouton de praticien (différents sélecteurs possibles)
-            for sel in [
-                'button[data-test*="practitioner"]',
-                'a[href*="/dentiste/"]',
-                'a[href*="/chirurgien-dentiste/"]',
-                'div.dl-card[role="button"]',
-                'button.profile-button',
-            ]:
-                el = await page.query_selector(sel)
-                if el:
-                    try:
-                        await el.click(timeout=3000)
-                        await page.wait_for_timeout(3000)
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+    # Vérifier où on est arrivé
+    try:
+        cur_url = page.url
+    except Exception:
+        cur_url = ""
 
-    if not captured:
+    if "/booking/motives" not in cur_url and "/booking/availabilities" not in cur_url:
+        # Probablement redirigé vers profil → pas de résa activée
         try:
-            for sel in [
-                'button[data-test*="visit-motive"]',
-                'button[class*="motive"]',
-                'div[role="button"][class*="motive"]',
-                'button.dl-button-primary',
-            ]:
-                el = await page.query_selector(sel)
-                if el:
-                    try:
-                        await el.click(timeout=3000)
-                        await page.wait_for_timeout(4000)
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    # Si toujours rien, fallback sur DOM count
-    if not captured:
-        try:
-            body_text = await page.evaluate("() => document.body.innerText || ''")
-            if "n'est pas sur Doctolib" in body_text or "Revendiquer mon profil" in body_text:
+            body = await page.evaluate("() => document.body.innerText || ''")
+            if "n'est pas sur Doctolib" in body or "Revendiquer mon profil" in body:
                 return 0, "not_on_doctolib", "negative_signal"
-            if "Aucune disponibilit" in body_text or "Pas de disponibilit" in body_text:
-                return 0, "ok", "text_no_avail"
-            return 0, "no_data", "no_xhr_no_clicks"
+            if "réservation n'est pas disponible" in body or "ne propose pas la prise de rendez-vous" in body:
+                return 0, "ok", "no_booking_active"
+            return 0, "ok", "no_booking_redirect"
         except Exception:
-            return 0, "no_data", "no_xhr"
+            return 0, "no_data", "no_redirect_no_body"
 
-    # Compter les slots dans toutes les réponses capturées (sur N jours = days)
+    # On est sur /booking/motives → cliquer le 1er motif "consultation"
+    if "/booking/motives" in cur_url:
+        clicked = False
+        try:
+            # Chercher tous les liens/boutons des motifs
+            motive_text = await page.evaluate("""() => {
+                const els = Array.from(document.querySelectorAll('a, button, [role="button"], div[class*="motive"], li'));
+                return els.filter(e => {
+                    const t = (e.innerText || '').trim();
+                    if (t.length < 3 || t.length > 80) return false;
+                    return /consultation|soins|d.tartrage|premi.re|examen/i.test(t);
+                }).slice(0, 5).map(e => e.innerText.trim().slice(0, 60));
+            }""")
+
+            # Cliquer le 1er motif qui matche un mot-clé prioritaire
+            for kw in MOTIVE_KEYWORDS:
+                clicked_attempt = await page.evaluate(f"""(() => {{
+                    const kw = "{kw}";
+                    const els = Array.from(document.querySelectorAll('a, button, [role="button"], div, li'));
+                    const target = els.find(e => {{
+                        const t = (e.innerText || '').toLowerCase().trim();
+                        return t.length > 2 && t.length < 100 && t.includes(kw);
+                    }});
+                    if (target) {{
+                        target.click();
+                        return target.innerText.trim().slice(0, 50);
+                    }}
+                    return null;
+                }})()""")
+                if clicked_attempt:
+                    clicked = True
+                    break
+
+            if not clicked:
+                return 0, "no_motives", f"no_match_kw"
+
+        except Exception as e:
+            return 0, "exception", f"motive_click:{type(e).__name__}"
+
+        # Attendre les XHR
+        await page.wait_for_timeout(8000)
+
+    # Compter les slots sur les `days` premiers jours
+    if not captured:
+        return 0, "no_data", "no_xhr_after_click"
+
     total_slots = 0
-    days_with_slots = 0
+    days_seen = 0
     for data in captured:
         if not isinstance(data, dict): continue
-        avail = data.get("availabilities", []) or []
-        for d in avail:
-            slots = d.get("slots", []) or []
-            if slots:
-                days_with_slots += 1
-                total_slots += len(slots)
+        # Doctolib retourne `total` (count global) + `availabilities` (par jour)
+        for d in (data.get("availabilities") or []):
+            slots = d.get("slots") or []
+            total_slots += len(slots)
+            days_seen += 1
+            if days_seen >= days:
+                break
+        if days_seen >= days:
+            break
 
-    return total_slots, "ok", f"xhr_capture:{len(captured)}resp_{days_with_slots}days"
+    return total_slots, "ok", f"xhr_{len(captured)}resp_{days_seen}days"
 
 
-async def _scrape_with_browser_robust(companies, min_slots, ws, results_acc, stats):
+async def _new_browser_page(pw):
+    browser = await pw.chromium.connect_over_cdp(SBR_WS, timeout=60_000)
+    page = await browser.new_page()
+    return browser, page
+
+
+async def _scrape_loop(companies, min_slots, days, ws, results_acc, stats):
     from playwright.async_api import async_playwright
-
-    pending_ckpt = []
+    pending = []
     n = len(companies)
 
     async with async_playwright() as pw:
         browser = None
         page = None
-        scraped_in_session = 0
+        in_session = 0
 
         for i, c in enumerate(companies, 1):
-            url = _company_doctolib_url(c)
-
+            url = _doctolib_url(c)
             if not url:
-                row = _row_for_company(c, "", 0, "no_url", "", min_slots)
-                results_acc.append(row); pending_ckpt.append(row)
+                row = _row(c, "", 0, "no_url", "", min_slots)
+                results_acc.append(row); pending.append(row)
                 stats["no_url"] = stats.get("no_url", 0) + 1
             else:
-                if browser is None or scraped_in_session >= BROWSER_REFRESH_EVERY:
+                if browser is None or in_session >= BROWSER_REFRESH_EVERY:
                     if browser is not None:
                         try: await browser.close()
                         except Exception: pass
                     try:
                         browser, page = await _new_browser_page(pw)
-                        scraped_in_session = 0
-                        log.info(f"  [{i}/{n}] Browser session refreshed")
+                        in_session = 0
+                        log.info(f"  [{i}/{n}] browser refreshed")
                     except Exception as e:
-                        log.error(f"  [{i}/{n}] Cannot connect Bright Data: {e}")
-                        row = _row_for_company(c, url, 0, "exception", f"connect:{type(e).__name__}", min_slots)
-                        results_acc.append(row); pending_ckpt.append(row)
+                        row = _row(c, url, 0, "exception", f"connect:{type(e).__name__}", min_slots)
+                        results_acc.append(row); pending.append(row)
                         stats["exception"] = stats.get("exception", 0) + 1
                         await asyncio.sleep(5)
                         continue
 
                 try:
-                    nb, status, mode = await _scrape_one_url(page, url, days=7)
-                    if status not in stats: stats[status] = 0
-                    stats[status] += 1
-                    row = _row_for_company(c, url, nb, status, mode, min_slots)
-                    results_acc.append(row); pending_ckpt.append(row)
-                    scraped_in_session += 1
+                    nb, status, mode = await _scrape_one(page, url, days)
+                    stats[status] = stats.get(status, 0) + 1
+                    row = _row(c, url, nb, status, mode, min_slots)
+                    results_acc.append(row); pending.append(row)
+                    in_session += 1
                     if nb >= min_slots:
-                        log.info(f"  [{i}/{n}] ✓ FAUTEUIL VIDE: {row['nom'][:40]} {row['ville'][:20]} = {nb} créneaux")
+                        log.info(f"  ✓ FAUTEUIL VIDE [{i}/{n}]: {row['nom'][:40]} {row['ville'][:20]} = {nb} créneaux")
                 except Exception as e:
                     err = type(e).__name__
-                    log.warning(f"  [{i}/{n}] {url[:60]} -> {err}")
-                    row = _row_for_company(c, url, 0, "exception", f"{err}:{str(e)[:80]}", min_slots)
-                    results_acc.append(row); pending_ckpt.append(row)
+                    log.warning(f"  [{i}/{n}] {url[:50]} -> {err}")
+                    row = _row(c, url, 0, "exception", f"{err}:{str(e)[:80]}", min_slots)
+                    results_acc.append(row); pending.append(row)
                     stats["exception"] = stats.get("exception", 0) + 1
                     try: await browser.close()
                     except Exception: pass
-                    browser = None; page = None; scraped_in_session = 0
+                    browser = None; page = None; in_session = 0
                     await asyncio.sleep(2)
 
-            if ws is not None and len(pending_ckpt) >= CHECKPOINT_EVERY:
+            if ws is not None and len(pending) >= CHECKPOINT_EVERY:
                 try:
-                    _gsheet_append_rows(ws, pending_ckpt)
-                    log.info(f"  [{i}/{n}] checkpoint +{len(pending_ckpt)} rows GSheet (cumul {len(results_acc)})")
-                    pending_ckpt = []
+                    _gsheet_append(ws, pending)
+                    log.info(f"  [{i}/{n}] +{len(pending)} GSheet (cumul {len(results_acc)}, stats={dict(stats)})")
+                    pending = []
                 except Exception as e:
-                    log.warning(f"  GSheet checkpoint failed: {e}")
-
-            if i % 25 == 0:
-                qcount = sum(1 for r in results_acc if r["nb_creneaux"] >= min_slots)
-                log.info(f"  [{i}/{n}] cumul stats={dict(stats)} >=seuil={qcount}")
+                    log.warning(f"  GSheet flush failed: {e}")
 
             await asyncio.sleep(0.3)
 
-        if ws is not None and pending_ckpt:
-            try:
-                _gsheet_append_rows(ws, pending_ckpt)
-                log.info(f"  Final checkpoint +{len(pending_ckpt)} rows")
-            except Exception as e:
-                log.warning(f"  Final GSheet flush failed: {e}")
+        if ws is not None and pending:
+            try: _gsheet_append(ws, pending)
+            except Exception as e: log.warning(f"  Final flush failed: {e}")
 
         if browser is not None:
             try: await browser.close()
@@ -388,30 +381,28 @@ async def _scrape_with_browser_robust(companies, min_slots, ws, results_acc, sta
 
 
 def run_with_ids(sellsy_ids, min_slots=5, days=7, label="ids"):
-    started_at = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== sellsy_tag_scan v6 (XHR intercept) : {len(sellsy_ids)} ids min_slots={min_slots} ===")
+    started = datetime.now(timezone.utc).isoformat()
+    log.info(f"=== sellsy_tag_scan v7 (booking flow) : {len(sellsy_ids)} ids ===")
 
     sellsy = SellsySync()
     companies = fetch_companies(sellsy, sellsy_ids, label)
     if not companies:
-        return {"error": "no_companies_resolved", "ids_count": len(sellsy_ids), "started_at": started_at}
+        return {"error":"no_companies","ids_count":len(sellsy_ids),"started_at":started}
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     ws_name = f"Fauteuils_Vides_{today}"
     sheet = _gsheet_open()
-    ws = _gsheet_init_tab(sheet, ws_name) if sheet else None
-    if ws is None:
-        log.warning("GSheet indisponible → pas de checkpoint")
+    ws = _gsheet_init(sheet, ws_name) if sheet else None
 
     results = []
-    stats = {"ok": 0, "no_url": 0, "not_on_doctolib": 0, "no_data": 0, "exception": 0}
+    stats = {}
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_scrape_with_browser_robust(companies, min_slots, ws, results, stats))
+        loop.run_until_complete(_scrape_loop(companies, min_slots, days, ws, results, stats))
     except Exception as e:
-        log.error(f"Fatal in scrape loop: {e}")
+        log.error(f"Fatal loop: {e}")
     finally:
         loop.close()
 
@@ -419,47 +410,38 @@ def run_with_ids(sellsy_ids, min_slots=5, days=7, label="ids"):
                        key=lambda r: r["nb_creneaux"], reverse=True)
 
     return {
-        "started_at": started_at,
+        "started_at": started,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "ids_playwright_v6_xhr",
+        "mode": "ids_playwright_v7_booking",
         "ids_count": len(sellsy_ids),
         "scraped": len(results),
         "qualified_over_threshold": len(qualified),
         "min_slots": min_slots, "days": days,
         "stats": stats, "gsheet_tab": ws_name,
-        "top10": [
-            {"sellsy_id": r["sellsy_id"], "nom": r["nom"], "ville": r["ville"], "nb_creneaux": r["nb_creneaux"]}
-            for r in qualified[:10]
-        ],
+        "top10": [{"sellsy_id":r["sellsy_id"],"nom":r["nom"],"ville":r["ville"],"nb_creneaux":r["nb_creneaux"]}
+                  for r in qualified[:10]],
     }
 
 
 def run(tag_names, min_slots=5, days=7):
-    return {
-        "error": "filter_by_smart_tags_unsupported_api_v2",
-        "hint": "Utilise sellsy_ids depuis l'export CSV.",
-        "tag_names": tag_names,
-    }
+    return {"error":"filter_unsupported","hint":"use sellsy_ids","tag_names":tag_names}
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tags", help="Smart-tag names (mode non supporté)")
-    parser.add_argument("--ids", help="Sellsy company IDs, comma-separated")
-    parser.add_argument("--min-slots", type=int, default=5)
-    parser.add_argument("--days", type=int, default=7)
-    parser.add_argument("--label", default="ids_batch")
-    args = parser.parse_args()
-
-    if args.ids:
-        ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()]
-        summary = run_with_ids(ids, min_slots=args.min_slots, days=args.days, label=args.label)
-    elif args.tags:
-        tags = [t.strip() for t in args.tags.split(",") if t.strip()]
-        summary = run(tag_names=tags, min_slots=args.min_slots, days=args.days)
+    p = argparse.ArgumentParser()
+    p.add_argument("--ids"); p.add_argument("--tags")
+    p.add_argument("--min-slots", type=int, default=5)
+    p.add_argument("--days", type=int, default=7)
+    p.add_argument("--label", default="ids_batch")
+    a = p.parse_args()
+    if a.ids:
+        ids = [int(x.strip()) for x in a.ids.split(",") if x.strip()]
+        s = run_with_ids(ids, a.min_slots, a.days, a.label)
+    elif a.tags:
+        s = run([t.strip() for t in a.tags.split(",")], a.min_slots, a.days)
     else:
-        parser.error("--tags ou --ids requis")
-    print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        p.error("--ids ou --tags requis")
+    print(json.dumps(s, indent=2, ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":
