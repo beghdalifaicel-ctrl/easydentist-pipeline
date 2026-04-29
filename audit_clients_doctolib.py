@@ -199,6 +199,28 @@ MOTIVE_KEYWORDS = re.compile(
 )
 
 
+def _normalize_url(url: str) -> str:
+    """
+    Strip query string + tout ce qui est après /booking, et reconstruit en
+    /booking?source=profile pour forcer Doctolib à passer par le funnel motif standard.
+
+    Ex:
+      /dentiste/paris/talia-guez/booking/motives?motiveCategoryIds=...
+      → /dentiste/paris/talia-guez/booking?source=profile
+
+      /centre-dentaire/.../booking/availabilities?...
+      → /centre-dentaire/.../booking?source=profile
+
+      /dentiste/marseille/foo/booking
+      → /dentiste/marseille/foo/booking?source=profile
+    """
+    if "/booking" in url:
+        base = url.split("/booking", 1)[0]
+    else:
+        base = url.split("?", 1)[0].rstrip("/")
+    return base + "/booking?source=profile"
+
+
 async def _new_browser_page(pw):
     browser = await pw.chromium.connect_over_cdp(SBR_WS, timeout=60_000)
     page = await browser.new_page()
@@ -207,8 +229,8 @@ async def _new_browser_page(pw):
 
 async def _scrape_one(page, url: str, max_days: int = 14):
     """
-    Navigate vers `url` (telle quelle), gère les étapes motive-categories / motives,
-    capture les XHR /availabilities.json, retourne :
+    Navigate vers `url` (normalisée en /booking?source=profile), gère les étapes
+    motive-categories / motives, capture les XHR /availabilities.json, retourne :
        (slots_7j, slots_8_14j, next_rdv_iso, status, mode)
     """
     captured = []
@@ -228,8 +250,10 @@ async def _scrape_one(page, url: str, max_days: int = 14):
 
     page.on("response", handle_response)
 
+    nav_url = _normalize_url(url)
+
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        await page.goto(nav_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     except Exception as e:
         return 0, 0, None, "exception", f"goto:{type(e).__name__}"
 
