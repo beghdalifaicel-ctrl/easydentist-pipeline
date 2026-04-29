@@ -4,6 +4,7 @@ Endpoints:
   /trigger/enrich    — Lance l'enrichissement Est/Pas sur Doctolib (bulk)
   /trigger/orchestrator — Lance le pipeline complet (scrape + qualify)
   /trigger/sellsy-tag-scan — Scan dispo Doctolib pour prospects Sellsy taggés
+  /trigger/audit-clients-doctolib — Audit hebdo clients Easydentist + reco budget Ads
   /status            — État des tâches en cours
   /health            — Health check Railway
 """
@@ -33,6 +34,7 @@ tasks_status = {
     "extract_emails": {"running": False, "last_run": None, "last_result": None},
     "extract_cabinet_name": {"running": False, "last_run": None, "last_result": None},
     "sellsy_tag_scan": {"running": False, "last_run": None, "last_result": None},
+    "audit_clients_doctolib": {"running": False, "last_run": None, "last_result": None},
 }
 
 
@@ -94,7 +96,6 @@ def trigger_enrich():
             "started_at": tasks_status["enrich"]["last_run"],
         }), 409
 
-    # Paramètres optionnels via query string
     batch_size = int(request.args.get("batch_size", 200))
     start_row = int(request.args.get("start_row", 2))
     concurrency = int(request.args.get("concurrency", 10))
@@ -133,13 +134,11 @@ def trigger_orchestrator():
             "started_at": tasks_status["orchestrator"]["last_run"],
         }), 409
 
-    # Paramètres
     city = request.args.get("city", "Paris")
     max_pages = int(request.args.get("max_pages", 5))
     dry_run = request.args.get("dry_run", "false").lower() == "true"
     specialty = request.args.get("specialty", "dentiste").strip().lower()
 
-    # Validation: la spécialité doit correspondre exactement à un slug Doctolib connu
     if specialty not in ALLOWED_SPECIALTIES:
         return jsonify({
             "status": "error",
@@ -175,7 +174,6 @@ def trigger_daily():
             "started_at": tasks_status["daily"]["last_run"],
         }), 409
 
-    # Paramètres
     max_pages = int(request.args.get("max_pages", 5))
     dry_run = request.args.get("dry_run", "false").lower() == "true"
     batch_size = int(request.args.get("batch_size", 30))
@@ -321,7 +319,7 @@ def trigger_sellsy_tag_scan():
 
     Query params :
       - tags : noms des smart-tags Sellsy, separes par virgule
-               (ex: "new cab avril 26,new centre avril 26")
+      - sellsy_ids : liste d'IDs Sellsy en mode fallback
       - min_slots : seuil minimum de creneaux (defaut 5)
       - days : fenetre de jours a scanner (defaut 7)
     """
@@ -387,12 +385,6 @@ def trigger_sellsy_retry_failed():
     """
     Rejoue les lignes en erreur (scrape_mode startswith 'connect:' par défaut)
     dans un onglet existant, et update les lignes EN PLACE.
-
-    Query params :
-      - tab : nom de l'onglet (défaut Fauteuils_Vides_<today>)
-      - prefix : préfixe scrape_mode à rejouer (défaut 'connect:')
-      - min_slots : seuil minimum (défaut 5)
-      - days : fenêtre jours (défaut 7)
     """
     if tasks_status["sellsy_tag_scan"]["running"]:
         return jsonify({
@@ -418,6 +410,37 @@ def trigger_sellsy_retry_failed():
         "mode": "retry_failed",
         "params": {"tab": tab or "auto_today", "prefix": prefix, "min_slots": min_slots, "days": days},
         "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
+        "poll": "/status",
+    }), 202
+
+
+@app.route("/trigger/audit-clients-doctolib", methods=["POST", "GET"])
+def trigger_audit_clients_doctolib():
+    """
+    Audit hebdomadaire des clients Easydentist : scrape leur dispo Doctolib
+    depuis le Sheet "Cron dépenses vs dispo clients" et retourne reco budget Ads
+    (UP/HOLD/DOWN/PAUSE) par client.
+
+    Query params :
+      - dry_run : true => ne scrape pas, retourne seulement la liste des clients lus
+    """
+    if tasks_status["audit_clients_doctolib"]["running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "Un audit est déjà en cours",
+            "started_at": tasks_status["audit_clients_doctolib"]["last_run"],
+        }), 409
+
+    dry_run = request.args.get("dry_run", "false").lower() == "true"
+
+    from audit_clients_doctolib import run_audit
+    run_sync_in_thread(run_audit, "audit_clients_doctolib", dry_run=dry_run)
+
+    return jsonify({
+        "status": "started",
+        "task": "audit_clients_doctolib",
+        "params": {"dry_run": dry_run},
+        "started_at": tasks_status["audit_clients_doctolib"]["last_run"],
         "poll": "/status",
     }), 202
 
@@ -452,6 +475,8 @@ def index():
             "/trigger/sellsy-tag-scan?tags=new+cab+avril+26,new+centre+avril+26&min_slots=5&days=7": "Params sellsy-tag-scan",
             "/trigger/sellsy-retry-failed": "POST/GET — Rejoue les lignes en 'connect:Error' d'un onglet et update en place",
             "/trigger/sellsy-retry-failed?tab=Fauteuils_Vides_2026-04-28&prefix=connect:&min_slots=5&days=7": "Params sellsy-retry-failed",
+            "/trigger/audit-clients-doctolib": "POST/GET — Audit dispo Doctolib des clients Easydentist + reco budget Google Ads",
+            "/trigger/audit-clients-doctolib?dry_run=true": "Dry-run : lit seulement le sheet, ne scrape pas",
             "/rotation-state": "GET — État de rotation des villes",
             "/status": "GET — État des tâches",
             "/health": "GET — Health check",
