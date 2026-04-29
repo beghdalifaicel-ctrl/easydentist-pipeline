@@ -1,43 +1,22 @@
 """
-audit_clients_doctolib.py — Audit hebdomadaire de la dispo Doctolib des CLIENTS Easydentist
-pour piloter leur budget Google Ads (UP / HOLD / DOWN / PAUSE).
+audit_clients_doctolib.py — Audit hebdomadaire dispo Doctolib des clients Easydentist.
 
-Source : Google Sheet "Cron dépenses vs dispo clients" (ID configurable via env)
-  Colonnes attendues (header en ligne 1) :
-    Clients | Budget | Target dépense € | Target conversion hebdo |
-    Landing Rdv | Planning docto/planity | Nb de créneaux à remplir sur 14 jours glissants |
-    Action (augmenter, baisser couper)
+V3 — API JSON Doctolib directe (fini le scraping click-by-click) :
+  1. Parse l'URL Doctolib pour extraire slug + IDs (placeId, practitionerId, motiveIds)
+  2. Bootstrap session via Bright Data Browser (cookies Doctolib)
+  3. Si motive_ids manquants → fetch /booking/{slug}.json pour avoir agenda_ids + motive_ids
+  4. Fetch /availabilities.json?practitioner_ids[]=X&motive_ids[]=Y&start_date=Z&limit=14
+  5. Score = slots 7j × 2 + slots 8-14j × 1 → reco UP/HOLD/DOWN/PAUSE
+  6. Output : onglet Audit_YYYY-MM-DD + colonne historique sur le sheet principal
 
-Workflow :
-  1. Lit toutes les lignes (skip vides + lignes sans URL Doctolib)
-  2. Pour chaque URL : Playwright + Bright Data Browser
-       a. Navigate vers l'URL TELLE QUELLE (les URLs du sheet contiennent déjà
-          motiveIds / motive-categories / etc.)
-       b. Selon la page atteinte :
-            - /booking/motive-categories -> click 1ère catégorie
-            - /booking/motives           -> click 1er motif "consultation/soins/..."
-            - /booking/availabilities ou autre -> attendre les XHR direct
-       c. Capture les XHR /availabilities.json
-       d. Compte les slots sur J0..J7 et J8..J14, prochaine date dispo
-  3. Score = slots_7j * 2 + slots_8_14j * 1
-  4. Reco selon seuils :
-       Score ≥ 30           -> UP+50%
-       Score 15..29         -> UP+20%
-       Score 5..14          -> HOLD
-       Score 1..4           -> DOWN
-       Score 0 et next>21j  -> PAUSE
-       Pas de budget        -> "Budget manquant"
-  5. Écrit un nouvel onglet daté "Audit_YYYY-MM-DD" + ajoute une colonne datée
-     dans l'onglet principal pour historiser.
-
-Endpoint Flask : voir make_webhook.py (route /trigger/audit-clients-doctolib).
+Source sheet : "Cron dépenses vs dispo clients" (env AUDIT_CLIENTS_SHEET_ID).
 """
 
 from __future__ import annotations
 
 import os, json, time, logging, asyncio, re
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse
+from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs
 
 from dotenv import load_dotenv
 
@@ -45,24 +24,21 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── ENV ────────────────────────────────────────────────────────────────────
 SBR_WS = os.getenv(
     "BRIGHT_DATA_BROWSER_WS",
     "wss://brd-customer-hl_dbe515e1-zone-doctolib_browser:ub9zsp721noa@brd.superproxy.io:9222",
 )
-
-# Sheet "Cron dépenses vs dispo clients"
 AUDIT_SHEET_ID = os.getenv(
     "AUDIT_CLIENTS_SHEET_ID",
     "1tR3DTTITPr3RGb5iL19F8eroEOCiMTX98h7xPMIFXaM",
 )
-AUDIT_SHEET_TAB = os.getenv("AUDIT_CLIENTS_SHEET_TAB", "")  # vide => premier onglet
+AUDIT_SHEET_TAB = os.getenv("AUDIT_CLIENTS_SHEET_TAB", "")
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
-BROWSER_REFRESH_EVERY = int(os.getenv("BROWSER_REFRESH_EVERY", "30"))
+BROWSER_REFRESH_EVERY = int(os.getenv("BROWSER_REFRESH_EVERY", "40"))
 PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "30000"))
 
 
@@ -76,18 +52,13 @@ def _gsheet_open():
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request as GRequest
     except ImportError:
-        log.error("gspread/google-auth manquants")
         return None
     creds = Credentials(
-        token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
+        token=None, refresh_token=GOOGLE_REFRESH_TOKEN,
+        client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET,
         token_uri="https://oauth2.googleapis.com/token",
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"],
     )
     creds.refresh(GRequest())
     return gspread.authorize(creds).open_by_key(AUDIT_SHEET_ID)
@@ -119,11 +90,10 @@ def _read_clients(sheet):
         if not row or all(not c.strip() for c in row):
             continue
         url = row[idx_doctolib].strip() if 0 <= idx_doctolib < len(row) else ""
-        # Filtre doctolib seulement
         if not url or "doctolib.fr" not in url.lower():
             continue
         clients.append({
-            "row_index": i,  # 1-based dans la feuille source
+            "row_index": i,
             "client": row[idx_client].strip() if 0 <= idx_client < len(row) else "",
             "budget_raw": row[idx_budget].strip() if 0 <= idx_budget < len(row) else "",
             "target_depense": row[idx_target_dep].strip() if 0 <= idx_target_dep < len(row) else "",
@@ -135,36 +105,22 @@ def _read_clients(sheet):
 
 
 def _parse_budget(raw: str) -> int:
-    """Parse '2 000 €' -> 2000. Retourne 0 si vide/invalide."""
     if not raw:
         return 0
     s = re.sub(r"[^\d]", "", raw)
     return int(s) if s else 0
 
 
-# ─── Scoring ───────────────────────────────────────────────────────────────
-def compute_reco(slots_7j: int, slots_8_14j: int, next_rdv_days: int | None,
-                 budget: int) -> dict:
-    """
-    Score = slots_7j * 2 + slots_8_14j * 1
-    Retourne dict {score, reco, action, budget_recommande, color}
-    """
+# ─── Scoring ────────────────────────────────────────────────────────────────
+def compute_reco(slots_7j, slots_8_14j, next_rdv_days, budget):
     if budget <= 0:
-        return {
-            "score": 0, "reco": "Budget manquant", "action": "À renseigner",
-            "budget_recommande": 0, "color": "GRAY",
-        }
-
+        return {"score": 0, "reco": "Budget manquant", "action": "À renseigner",
+                "budget_recommande": 0, "color": "GRAY"}
     score = slots_7j * 2 + slots_8_14j * 1
-
-    # PAUSE si saturé : 0 slot 14j ET prochain RDV > 21j (ou inconnu)
     if score == 0 and (next_rdv_days is None or next_rdv_days > 21):
-        return {
-            "score": score, "reco": "PAUSE",
-            "action": "Couper provisoirement (saturé)",
-            "budget_recommande": 0, "color": "RED",
-        }
-
+        return {"score": score, "reco": "PAUSE",
+                "action": "Couper provisoirement (saturé)",
+                "budget_recommande": 0, "color": "RED"}
     if score >= 30:
         new_b = round(budget * 1.50)
         return {"score": score, "reco": "UP+50%",
@@ -176,49 +132,93 @@ def compute_reco(slots_7j: int, slots_8_14j: int, next_rdv_days: int | None,
                 "action": f"Augmenter de {budget}€ à {new_b}€",
                 "budget_recommande": new_b, "color": "BLUE"}
     if score >= 5:
-        return {"score": score, "reco": "HOLD",
-                "action": "Maintenir",
+        return {"score": score, "reco": "HOLD", "action": "Maintenir",
                 "budget_recommande": budget, "color": "GREEN"}
     if score >= 1:
         new_b = round(budget * 0.70)
         return {"score": score, "reco": "DOWN-30%",
                 "action": f"Baisser de {budget}€ à {new_b}€",
                 "budget_recommande": new_b, "color": "ORANGE"}
-
-    # score == 0 mais next_rdv connu et <= 21j : DOWN soft
     new_b = round(budget * 0.80)
     return {"score": score, "reco": "DOWN-20%",
             "action": f"Baisser de {budget}€ à {new_b}€ (faible dispo)",
             "budget_recommande": new_b, "color": "ORANGE"}
 
 
-# ─── Scraper ────────────────────────────────────────────────────────────────
-MOTIVE_KEYWORDS = re.compile(
-    r"consultation|soins|d[ée]tartrage|premi[èe]re|examen|d[ée]brid|nouvelle? patient",
-    re.I,
-)
-
-
-def _normalize_url(url: str) -> str:
-    """
-    Strip query string + tout ce qui est après /booking, et reconstruit en
-    /booking?source=profile pour forcer Doctolib à passer par le funnel motif standard.
-
-    Ex:
-      /dentiste/paris/talia-guez/booking/motives?motiveCategoryIds=...
-      → /dentiste/paris/talia-guez/booking?source=profile
-
-      /centre-dentaire/.../booking/availabilities?...
-      → /centre-dentaire/.../booking?source=profile
-
-      /dentiste/marseille/foo/booking
-      → /dentiste/marseille/foo/booking?source=profile
-    """
-    if "/booking" in url:
-        base = url.split("/booking", 1)[0]
+# ─── Doctolib API helpers ───────────────────────────────────────────────────
+def _parse_doctolib_url(url: str) -> dict:
+    """Extract slug + IDs from any Doctolib booking URL."""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    path = parsed.path
+    if "/booking" in path:
+        slug = path.split("/booking", 1)[0].lstrip("/")
     else:
-        base = url.split("?", 1)[0].rstrip("/")
-    return base + "/booking?source=profile"
+        slug = path.lstrip("/").rstrip("/")
+
+    def _ids(key):
+        # Doctolib accepts both `key[]=` and `key=` for arrays
+        out = []
+        for k in (f"{key}[]", key):
+            for v in qs.get(k, []):
+                try:
+                    out.append(int(v))
+                except (ValueError, TypeError):
+                    pass
+        return out
+
+    practitioner_id = None
+    pid_raw = (qs.get("practitionerId") or qs.get("practitioner_id") or [None])[0]
+    if pid_raw:
+        try:
+            practitioner_id = int(pid_raw)
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        "slug": slug,
+        "place_id": (qs.get("placeId") or qs.get("place_id") or [None])[0],
+        "practitioner_id": practitioner_id,
+        "motive_ids": _ids("motiveIds") + _ids("motive_ids"),
+        "motive_category_ids": _ids("motiveCategoryIds") + _ids("motive_category_ids"),
+        "speciality_id": (qs.get("specialityId") or qs.get("speciality_id") or [None])[0],
+    }
+
+
+async def _fetch_json(page, url: str):
+    """Fetch JSON via the Bright Data browser. Page must be on doctolib.fr first."""
+    try:
+        result = await page.evaluate("""async (u) => {
+            try {
+                const r = await fetch(u, {
+                    headers: {
+                        'Accept': 'application/json, text/javascript, */*; q=0.01',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    credentials: 'include'
+                });
+                const status = r.status;
+                if (!r.ok) return {__error: 'http_' + status};
+                const text = await r.text();
+                try { return JSON.parse(text); }
+                catch(e) { return {__error: 'parse_fail', __body: text.slice(0, 200)}; }
+            } catch(e) { return {__error: 'fetch_fail', __detail: String(e)}; }
+        }""", url)
+        return result if isinstance(result, dict) else {"__error": "non_dict"}
+    except Exception as e:
+        return {"__error": "evaluate_fail", "__detail": str(e)[:80]}
+
+
+async def _bootstrap_session(page) -> bool:
+    """Navigate to doctolib homepage to set up cookies."""
+    try:
+        await page.goto("https://www.doctolib.fr/", wait_until="domcontentloaded",
+                        timeout=PAGE_TIMEOUT_MS)
+        await page.wait_for_timeout(2500)
+        return True
+    except Exception as e:
+        log.warning(f"Bootstrap fail: {e}")
+        return False
 
 
 async def _new_browser_page(pw):
@@ -227,143 +227,114 @@ async def _new_browser_page(pw):
     return browser, page
 
 
-async def _scrape_one(page, url: str, max_days: int = 14):
+async def _scrape_one(page, url: str):
     """
-    Navigate vers `url` (normalisée en /booking?source=profile), gère les étapes
-    motive-categories / motives, capture les XHR /availabilities.json, retourne :
-       (slots_7j, slots_8_14j, next_rdv_iso, status, mode)
+    Fetch availabilities via Doctolib's JSON API.
+    Returns: (slots_7j, slots_8_14j, next_rdv_iso, status, mode)
     """
-    captured = []
+    parsed = _parse_doctolib_url(url)
+    slug = parsed["slug"]
+    if not slug:
+        return 0, 0, None, "no_slug", "url_unparseable"
 
-    async def handle_response(response):
-        try:
-            if "availabilities.json" in response.url:
-                ct = response.headers.get("content-type", "")
-                if "json" in ct.lower():
-                    try:
-                        data = await response.json()
-                        captured.append(data)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+    motive_ids = list(parsed["motive_ids"])
+    practitioner_id = parsed["practitioner_id"]
+    agenda_ids = []
+    visit_motives_lookup = {}  # id -> name, for picking right motives
 
-    page.on("response", handle_response)
-
-    nav_url = _normalize_url(url)
+    # Step 1: get booking config
+    config_url = f"https://www.doctolib.fr/booking/{slug}.json"
+    cfg = await _fetch_json(page, config_url)
+    if "__error" in cfg:
+        return 0, 0, None, "config_fail", cfg.get("__error", "?")
 
     try:
-        await page.goto(nav_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        data = cfg.get("data") or {}
+        agendas = data.get("agendas") or []
+        if not agendas:
+            return 0, 0, None, "no_agenda", "config_empty"
+
+        # Match agenda(s) to practitioner_id if specified, else take all
+        for a in agendas:
+            aid = a.get("id")
+            apid = a.get("practitioner_id")
+            if practitioner_id and apid != practitioner_id:
+                continue
+            if aid:
+                agenda_ids.append(aid)
+            if not practitioner_id and apid:
+                practitioner_id = apid
+
+        if not agenda_ids:
+            # Fallback: take all agendas
+            agenda_ids = [a.get("id") for a in agendas if a.get("id")]
+
+        # Build motive lookup
+        for vm in (data.get("visit_motives") or []):
+            mid = vm.get("id")
+            if mid:
+                visit_motives_lookup[mid] = (vm.get("name") or "").lower()
+
+        # If we don't have motive_ids from URL, pick "consultation/première"
+        if not motive_ids:
+            re_consult = re.compile(r"consultation|premi[èe]re|soins|d[ée]tartrage|examen|nouveau patient|nouvelle patient", re.I)
+            for mid, name in visit_motives_lookup.items():
+                if re_consult.search(name):
+                    motive_ids.append(mid)
+            # Fallback to first 3 if nothing matched
+            if not motive_ids and visit_motives_lookup:
+                motive_ids = list(visit_motives_lookup.keys())[:3]
+
     except Exception as e:
-        return 0, 0, None, "exception", f"goto:{type(e).__name__}"
+        return 0, 0, None, "config_parse_fail", f"{type(e).__name__}:{str(e)[:60]}"
 
-    await page.wait_for_timeout(4000)
+    if not motive_ids:
+        return 0, 0, None, "no_motive_ids", "after_lookup"
+    if not agenda_ids:
+        return 0, 0, None, "no_agenda_ids", "after_lookup"
 
-    try:
-        cur_url = page.url
-    except Exception:
-        cur_url = ""
+    # Step 2: fetch availabilities
+    today = datetime.now(timezone.utc).date()
+    params = [f"start_date={today.strftime('%Y-%m-%d')}", "limit=14"]
+    for mid in motive_ids[:5]:
+        params.append(f"motive_ids[]={mid}")
+    for aid in agenda_ids[:5]:
+        params.append(f"agenda_ids[]={aid}")
+    if practitioner_id:
+        params.append(f"practitioner_ids[]={practitioner_id}")
 
-    # Détection page erreur / pas sur Doctolib
-    try:
-        body = await page.evaluate("() => document.body.innerText || ''")
-    except Exception:
-        body = ""
+    avail_url = f"https://www.doctolib.fr/availabilities.json?{'&'.join(params)}"
+    avail = await _fetch_json(page, avail_url)
+    if "__error" in avail:
+        return 0, 0, None, "avail_fail", avail.get("__error", "?")
 
-    if "n'est pas sur Doctolib" in body or "Page introuvable" in body:
-        return 0, 0, None, "not_on_doctolib", "negative_signal"
-
-    # Étape : motive-categories ?
-    if "/booking/motive-categories" in cur_url:
-        try:
-            clicked = await page.evaluate("""() => {
-                const cands = Array.from(document.querySelectorAll('a, button, [role="button"], li'))
-                    .filter(e => {
-                        const t = (e.innerText || '').trim();
-                        return t.length > 3 && t.length < 80;
-                    })
-                    .sort((a,b) => a.innerText.length - b.innerText.length);
-                const target = cands.find(e => e.innerText.trim().length > 6);
-                if (!target) return null;
-                target.click();
-                return target.innerText.trim();
-            }""")
-            await page.wait_for_timeout(3000)
-            cur_url = page.url
-        except Exception as e:
-            return 0, 0, None, "exception", f"cat_click:{type(e).__name__}"
-
-    # Étape : motives ?
-    if "/booking/motives" in cur_url:
-        try:
-            clicked = await page.evaluate(r"""() => {
-                const re = /consultation|soins|d.tartrage|premi.re|examen|d.brid|nouvelle? patient/i;
-                let cands = Array.from(document.querySelectorAll('a, button, [role="button"], li'))
-                    .filter(e => {
-                        const t = (e.innerText || '').trim();
-                        return t.length > 3 && t.length < 60 && re.test(t);
-                    })
-                    .sort((a,b) => a.innerText.length - b.innerText.length);
-                if (cands.length === 0) {
-                    cands = Array.from(document.querySelectorAll('a, button'))
-                        .filter(e => {
-                            const t = (e.innerText || '').trim();
-                            return t.length > 6 && t.length < 60;
-                        })
-                        .sort((a,b) => a.innerText.length - b.innerText.length);
-                }
-                if (cands.length === 0) return null;
-                cands[0].click();
-                return cands[0].innerText.trim();
-            }""")
-            if not clicked:
-                return 0, 0, None, "no_motives", "no_button_found"
-            await page.wait_for_timeout(8000)
-        except Exception as e:
-            return 0, 0, None, "exception", f"motive_click:{type(e).__name__}"
-    else:
-        # Pas de page motives -> on attend simplement les XHR
-        await page.wait_for_timeout(6000)
-
-    # Compte les slots
-    if not captured:
-        return 0, 0, None, "no_data", "no_xhr"
-
+    # Step 3: count slots
     slots_7j = 0
     slots_8_14j = 0
-    next_rdv_iso = None
-    today = datetime.now(timezone.utc).date()
+    next_iso = None
+    ns = avail.get("next_slot")
+    if isinstance(ns, str):
+        next_iso = ns[:10]
 
-    for data in captured:
-        if not isinstance(data, dict):
+    for d in (avail.get("availabilities") or []):
+        date_str = (d.get("date") or "")[:10]
+        slots = d.get("slots") or []
+        if not date_str or not slots:
             continue
-        # Cherche `next_slot` ou `next_availability` au top level
-        for key in ("next_slot", "next_availability", "nextAvailability"):
-            v = data.get(key)
-            if v and not next_rdv_iso:
-                if isinstance(v, str):
-                    next_rdv_iso = v[:10]
-                elif isinstance(v, dict):
-                    next_rdv_iso = v.get("date") or v.get("start_date")
-        # Slots par jour
-        for d in (data.get("availabilities") or []):
-            date_str = d.get("date") or ""
-            slots = d.get("slots") or []
-            if not date_str or not slots:
-                continue
-            try:
-                day = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            delta = (day - today).days
-            if 0 <= delta <= 7:
-                slots_7j += len(slots)
-            elif 8 <= delta <= 14:
-                slots_8_14j += len(slots)
-            if not next_rdv_iso and slots:
-                next_rdv_iso = date_str[:10]
+        try:
+            day = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        delta = (day - today).days
+        if 0 <= delta <= 7:
+            slots_7j += len(slots)
+        elif 8 <= delta <= 14:
+            slots_8_14j += len(slots)
+        if not next_iso:
+            next_iso = date_str
 
-    return slots_7j, slots_8_14j, next_rdv_iso, "ok", f"xhr_{len(captured)}resp"
+    total = avail.get("total", 0)
+    return slots_7j, slots_8_14j, next_iso, "ok", f"api_total={total}_motives={len(motive_ids)}"
 
 
 # ─── Loop ──────────────────────────────────────────────────────────────────
@@ -380,14 +351,16 @@ async def _scrape_loop(clients, results_acc, stats):
             url = c["doctolib_url"]
             budget = _parse_budget(c["budget_raw"])
 
+            # (Re)connect browser + bootstrap session
             if browser is None or in_session >= BROWSER_REFRESH_EVERY:
                 if browser is not None:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
+                    try: await browser.close()
+                    except Exception: pass
                 try:
                     browser, page = await _new_browser_page(pw)
+                    ok = await _bootstrap_session(page)
+                    if not ok:
+                        log.warning(f"  [{i}/{n}] bootstrap fail")
                     in_session = 0
                     log.info(f"  [{i}/{n}] browser refreshed")
                 except Exception as e:
@@ -413,18 +386,13 @@ async def _scrape_loop(clients, results_acc, stats):
                         pass
 
                 reco = compute_reco(s7, s14, next_rdv_days, budget)
-                row = {
-                    **c, "budget": budget,
-                    "slots_7j": s7, "slots_8_14j": s14,
-                    "next_rdv": next_iso, "next_rdv_days": next_rdv_days,
-                    "status": status, "mode": mode, **reco,
-                }
+                row = {**c, "budget": budget,
+                       "slots_7j": s7, "slots_8_14j": s14,
+                       "next_rdv": next_iso, "next_rdv_days": next_rdv_days,
+                       "status": status, "mode": mode, **reco}
                 results_acc.append(row)
                 in_session += 1
-                log.info(
-                    f"  [{i}/{n}] {c['client'][:30]:30s} "
-                    f"7j={s7:3d} 14j={s14:3d} score={reco['score']:3d} -> {reco['reco']}"
-                )
+                log.info(f"  [{i}/{n}] {c['client'][:30]:30s} 7j={s7:3d} 14j={s14:3d} score={reco['score']:3d} -> {reco['reco']} ({status})")
             except Exception as e:
                 log.warning(f"  [{i}/{n}] {c['client'][:30]} exception: {e}")
                 results_acc.append({**c, "budget": budget,
@@ -432,22 +400,18 @@ async def _scrape_loop(clients, results_acc, stats):
                     "status": "exception", "mode": f"{type(e).__name__}:{str(e)[:60]}",
                     **compute_reco(0, 0, None, budget)})
                 stats["exception"] = stats.get("exception", 0) + 1
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+                try: await browser.close()
+                except Exception: pass
                 browser = None
                 page = None
                 in_session = 0
                 await asyncio.sleep(2)
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
         if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+            try: await browser.close()
+            except Exception: pass
 
 
 # ─── GSheet write ──────────────────────────────────────────────────────────
@@ -457,6 +421,14 @@ AUDIT_HEADERS = [
     "Reco", "Action", "Budget recommandé (€)", "Color",
     "Status scrape", "Mode", "Date audit",
 ]
+
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
 def _write_audit_tab(sheet, results, today_str):
@@ -471,20 +443,12 @@ def _write_audit_tab(sheet, results, today_str):
     rows = []
     for r in results:
         rows.append([
-            r.get("client", ""),
-            r.get("doctolib_url", ""),
-            r.get("budget", 0),
-            r.get("slots_7j", 0),
-            r.get("slots_8_14j", 0),
-            r.get("next_rdv") or "",
-            r.get("score", 0),
-            r.get("reco", ""),
-            r.get("action", ""),
-            r.get("budget_recommande", 0),
-            r.get("color", ""),
-            r.get("status", ""),
-            r.get("mode", ""),
-            today_str,
+            r.get("client", ""), r.get("doctolib_url", ""), r.get("budget", 0),
+            r.get("slots_7j", 0), r.get("slots_8_14j", 0),
+            r.get("next_rdv") or "", r.get("score", 0),
+            r.get("reco", ""), r.get("action", ""),
+            r.get("budget_recommande", 0), r.get("color", ""),
+            r.get("status", ""), r.get("mode", ""), today_str,
         ])
     if rows:
         ws.append_rows(rows, value_input_option="USER_ENTERED")
@@ -492,23 +456,15 @@ def _write_audit_tab(sheet, results, today_str):
 
 
 def _write_history_column(ws_main, results, today_str):
-    """Ajoute une colonne 'Reco YYYY-MM-DD' en bout de l'onglet principal pour historiser."""
     try:
         existing = ws_main.row_values(1)
         new_col_idx = len(existing) + 1
         col_letter = _col_letter(new_col_idx)
-        # header
         ws_main.update(f"{col_letter}1", [[f"Reco {today_str}"]])
-        # data : on doit aligner sur row_index de chaque résultat
-        rows_to_write = []
-        # Map row_index -> reco string
         idx_to_reco = {r["row_index"]: f"{r.get('reco','')} (score {r.get('score',0)})"
                        for r in results}
-        # Récupérer la hauteur de la feuille
         last_row = max([r["row_index"] for r in results]) if results else 1
-        col_data = []
-        for ri in range(2, last_row + 1):
-            col_data.append([idx_to_reco.get(ri, "")])
+        col_data = [[idx_to_reco.get(ri, "")] for ri in range(2, last_row + 1)]
         if col_data:
             ws_main.update(f"{col_letter}2", col_data, value_input_option="USER_ENTERED")
         return col_letter
@@ -517,25 +473,10 @@ def _write_history_column(ws_main, results, today_str):
         return None
 
 
-def _col_letter(n: int) -> str:
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
 # ─── Entry point ───────────────────────────────────────────────────────────
 def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
-    """
-    Exécute l'audit complet :
-      - Lit le sheet "Cron dépenses vs dispo clients"
-      - Scrape chaque URL Doctolib
-      - Calcule score + reco
-      - Écrit un onglet Audit_YYYY-MM-DD + colonne historique sur l'onglet principal
-    """
     started = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== audit_clients_doctolib start (dry_run={dry_run}) ===")
+    log.info(f"=== audit_clients_doctolib v3 (API JSON) start (dry_run={dry_run}) ===")
 
     sheet = _gsheet_open()
     if sheet is None:
@@ -547,12 +488,8 @@ def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
         return {"error": "no_clients_found", "started_at": started}
 
     if dry_run:
-        return {
-            "dry_run": True,
-            "clients_count": len(clients),
-            "sample": clients[:5],
-            "started_at": started,
-        }
+        return {"dry_run": True, "clients_count": len(clients),
+                "sample": clients[:5], "started_at": started}
 
     results = []
     stats = {}
@@ -569,7 +506,6 @@ def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     audit_tab = _write_audit_tab(sheet, results, today)
     hist_col = _write_history_column(ws_main, results, today)
 
-    # Synthèse
     by_reco = {}
     for r in results:
         by_reco[r.get("reco", "?")] = by_reco.get(r.get("reco", "?"), 0) + 1
@@ -581,6 +517,7 @@ def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     return {
         "started_at": started,
         "ended_at": datetime.now(timezone.utc).isoformat(),
+        "version": "v3_api_json",
         "clients_count": len(clients),
         "scraped": len(results),
         "audit_tab": audit_tab,
@@ -592,8 +529,9 @@ def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
         "top_alertes": [
             {"client": r["client"], "reco": r.get("reco"),
              "score": r.get("score"), "budget": r.get("budget"),
-             "budget_reco": r.get("budget_recommande")}
-            for r in sorted(results, key=lambda x: x.get("score", 0))[:5]
+             "budget_reco": r.get("budget_recommande"),
+             "next_rdv": r.get("next_rdv")}
+            for r in sorted(results, key=lambda x: x.get("score", 0))[:10]
         ],
     }
 
