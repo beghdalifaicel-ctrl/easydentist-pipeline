@@ -382,6 +382,46 @@ def trigger_sellsy_tag_scan():
     }), 202
 
 
+@app.route("/trigger/sellsy-retry-failed", methods=["POST", "GET"])
+def trigger_sellsy_retry_failed():
+    """
+    Rejoue les lignes en erreur (scrape_mode startswith 'connect:' par défaut)
+    dans un onglet existant, et update les lignes EN PLACE.
+
+    Query params :
+      - tab : nom de l'onglet (défaut Fauteuils_Vides_<today>)
+      - prefix : préfixe scrape_mode à rejouer (défaut 'connect:')
+      - min_slots : seuil minimum (défaut 5)
+      - days : fenêtre jours (défaut 7)
+    """
+    if tasks_status["sellsy_tag_scan"]["running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "Un scan est déjà en cours",
+            "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    tab = request.args.get("tab", "") or body.get("tab", "") or None
+    prefix = request.args.get("prefix", "") or body.get("prefix", "") or "connect:"
+    min_slots = int(request.args.get("min_slots", 5))
+    days = int(request.args.get("days", 7))
+
+    from sellsy_tag_scan import run_retry_failed
+    run_sync_in_thread(run_retry_failed, "sellsy_tag_scan",
+                       tab_name=tab, min_slots=min_slots, days=days,
+                       status_filter_prefix=prefix)
+
+    return jsonify({
+        "status": "started",
+        "task": "sellsy_tag_scan",
+        "mode": "retry_failed",
+        "params": {"tab": tab or "auto_today", "prefix": prefix, "min_slots": min_slots, "days": days},
+        "started_at": tasks_status["sellsy_tag_scan"]["last_run"],
+        "poll": "/status",
+    }), 202
+
+
 @app.route("/status", methods=["GET"])
 def status():
     """État de toutes les tâches."""
@@ -410,6 +450,8 @@ def index():
             "/trigger/extract-cabinet-name": "POST/GET — Extraction noms établissements",
             "/trigger/sellsy-tag-scan": "POST/GET — Scan dispo Doctolib pour prospects Sellsy taggés (fauteuils vides)",
             "/trigger/sellsy-tag-scan?tags=new+cab+avril+26,new+centre+avril+26&min_slots=5&days=7": "Params sellsy-tag-scan",
+            "/trigger/sellsy-retry-failed": "POST/GET — Rejoue les lignes en 'connect:Error' d'un onglet et update en place",
+            "/trigger/sellsy-retry-failed?tab=Fauteuils_Vides_2026-04-28&prefix=connect:&min_slots=5&days=7": "Params sellsy-retry-failed",
             "/rotation-state": "GET — État de rotation des villes",
             "/status": "GET — État des tâches",
             "/health": "GET — Health check",

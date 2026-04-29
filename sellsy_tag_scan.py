@@ -427,6 +427,163 @@ def run(tag_names, min_slots=5, days=7):
     return {"error":"filter_unsupported","hint":"use sellsy_ids","tag_names":tag_names}
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# RETRY MODE : relit un onglet existant et rejoue les lignes en erreur
+# ────────────────────────────────────────────────────────────────────────────
+
+async def _scrape_loop_update(companies_with_row, min_slots, days, ws, results_acc, stats):
+    """Variante de _scrape_loop qui UPDATE les lignes existantes au lieu d'append.
+    companies_with_row : list[(company_dict, row_index_1based_in_sheet)]"""
+    from playwright.async_api import async_playwright
+    n = len(companies_with_row)
+
+    async with async_playwright() as pw:
+        browser = None; page = None; in_session = 0
+
+        for i, (c, row_idx) in enumerate(companies_with_row, 1):
+            url = _doctolib_url(c)
+            row_data = None
+
+            if not url:
+                row_data = _row(c, "", 0, "no_url", "", min_slots)
+                stats["no_url"] = stats.get("no_url", 0) + 1
+            else:
+                if browser is None or in_session >= BROWSER_REFRESH_EVERY:
+                    if browser is not None:
+                        try: await browser.close()
+                        except Exception: pass
+                    try:
+                        browser, page = await _new_browser_page(pw)
+                        in_session = 0
+                        log.info(f"  [{i}/{n}] browser refreshed")
+                    except Exception as e:
+                        row_data = _row(c, url, 0, "exception", f"connect:{type(e).__name__}", min_slots)
+                        stats["exception"] = stats.get("exception", 0) + 1
+                        await asyncio.sleep(5)
+
+                if row_data is None:
+                    try:
+                        nb, status, mode = await _scrape_one(page, url, days)
+                        stats[status] = stats.get(status, 0) + 1
+                        row_data = _row(c, url, nb, status, mode, min_slots)
+                        in_session += 1
+                        if nb >= min_slots:
+                            log.info(f"  ✓ FAUTEUIL VIDE [{i}/{n}]: {row_data['nom'][:40]} = {nb} créneaux")
+                    except Exception as e:
+                        err = type(e).__name__
+                        log.warning(f"  [{i}/{n}] retry exception {err}")
+                        row_data = _row(c, url, 0, "exception", f"{err}:{str(e)[:80]}", min_slots)
+                        stats["exception"] = stats.get("exception", 0) + 1
+                        try: await browser.close()
+                        except Exception: pass
+                        browser = None; page = None; in_session = 0
+                        await asyncio.sleep(2)
+
+            results_acc.append(row_data)
+
+            # Update la ligne dans le sheet
+            if ws is not None:
+                try:
+                    values = [[row_data.get(h) for h in GHEADERS]]
+                    ws.update(f"A{row_idx}:L{row_idx}", values, value_input_option="USER_ENTERED")
+                except Exception as e:
+                    log.warning(f"  GSheet row {row_idx} update failed: {e}")
+
+            await asyncio.sleep(0.3)
+
+        if browser is not None:
+            try: await browser.close()
+            except Exception: pass
+
+
+def run_retry_failed(tab_name=None, min_slots=5, days=7, status_filter_prefix="connect:"):
+    """Lit l'onglet `tab_name` (ou Fauteuils_Vides_<today> par défaut),
+    identifie les lignes où scrape_mode commence par `status_filter_prefix`,
+    rejoue le scrape Doctolib pour chacune, et met à jour les lignes en place."""
+    started = datetime.now(timezone.utc).isoformat()
+
+    sheet = _gsheet_open()
+    if sheet is None:
+        return {"error":"no_gsheet_creds","started_at":started}
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not tab_name:
+        tab_name = f"Fauteuils_Vides_{today}"
+
+    try:
+        ws = sheet.worksheet(tab_name)
+    except Exception as e:
+        return {"error":"tab_not_found","tab":tab_name,"detail":str(e),"started_at":started}
+
+    all_rows = ws.get_all_values()
+    if not all_rows or len(all_rows) < 2:
+        return {"error":"empty_tab","tab":tab_name,"started_at":started}
+
+    headers = all_rows[0]
+    try:
+        idx_id = headers.index("sellsy_id")
+        idx_mode = headers.index("scrape_mode")
+    except ValueError:
+        return {"error":"missing_headers","headers":headers,"started_at":started}
+
+    # Identifier les lignes en erreur
+    targets = []  # list of (sellsy_id, row_idx_1based)
+    for i, row in enumerate(all_rows[1:], start=2):  # row 2 is first data row
+        if len(row) <= max(idx_id, idx_mode): continue
+        mode = (row[idx_mode] or "").strip()
+        if mode.startswith(status_filter_prefix):
+            try:
+                sid = int(row[idx_id])
+                targets.append((sid, i))
+            except Exception:
+                pass
+
+    log.info(f"=== Retry mode : {len(targets)} lignes en '{status_filter_prefix}*' à rejouer (tab={tab_name}) ===")
+    if not targets:
+        return {"started_at":started,"tab":tab_name,"to_retry":0,"message":"no rows matched"}
+
+    # Récup fiches Sellsy
+    sellsy = SellsySync()
+    sellsy._ensure_token()
+    companies_with_row = []
+    for sid, row_idx in targets:
+        c = sellsy.get_company(sid)
+        if c:
+            c["_tag_label"] = "retry"
+            companies_with_row.append((c, row_idx))
+
+    log.info(f"Fiches Sellsy ok : {len(companies_with_row)}/{len(targets)}")
+
+    results = []
+    stats = {}
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_scrape_loop_update(companies_with_row, min_slots, days, ws, results, stats))
+    except Exception as e:
+        log.error(f"Retry fatal loop: {e}")
+    finally:
+        loop.close()
+
+    qualified = sorted([r for r in results if r["nb_creneaux"] >= min_slots],
+                       key=lambda r: r["nb_creneaux"], reverse=True)
+
+    return {
+        "started_at": started,
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "retry_failed_v1",
+        "tab": tab_name,
+        "to_retry": len(targets),
+        "fetched_from_sellsy": len(companies_with_row),
+        "rescraped": len(results),
+        "qualified_over_threshold": len(qualified),
+        "min_slots": min_slots, "days": days,
+        "stats": stats,
+        "top10": [{"sellsy_id":r["sellsy_id"],"nom":r["nom"],"ville":r["ville"],"nb_creneaux":r["nb_creneaux"]}
+                  for r in qualified[:10]],
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ids"); p.add_argument("--tags")
