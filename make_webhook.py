@@ -4,6 +4,7 @@ Endpoints:
   /trigger/enrich    — Lance l'enrichissement Est/Pas sur Doctolib (bulk)
   /trigger/orchestrator — Lance le pipeline complet (scrape + qualify)
   /trigger/sellsy-tag-scan — Scan dispo Doctolib pour prospects Sellsy taggés
+  /trigger/audit-clients-doctolib — Audit hebdo clients existants (slots 7j + reco budget)
   /status            — État des tâches en cours
   /health            — Health check Railway
 """
@@ -33,6 +34,7 @@ tasks_status = {
     "extract_emails": {"running": False, "last_run": None, "last_result": None},
     "extract_cabinet_name": {"running": False, "last_run": None, "last_result": None},
     "sellsy_tag_scan": {"running": False, "last_run": None, "last_result": None},
+    "audit_clients_doctolib": {"running": False, "last_run": None, "last_result": None},
 }
 
 
@@ -469,6 +471,44 @@ def trigger_sellsy_retry_failed():
     }), 202
 
 
+@app.route("/trigger/audit-clients-doctolib", methods=["POST", "GET"])
+def trigger_audit_clients_doctolib():
+    """
+    Audit hebdomadaire des clients Easydentist : scrape Doctolib (slots 7j +
+    8-14j) pour chaque client référencé dans le Sheet 'Cron dépenses vs dispo
+    clients' (env AUDIT_CLIENTS_SHEET_ID), calcule un score (slots_7j × 2 +
+    slots_8_14j) → reco UP+50% / UP+20% / HOLD / DOWN-30% / DOWN-20% / PAUSE,
+    écrit un onglet Audit_<date> + une colonne historique sur le sheet principal.
+
+    Source : audit_clients_doctolib.py (V3.1 — API JSON Doctolib + fix CF clearance).
+
+    Query params :
+      - dry_run : si true, ne fait que lire les clients (pas de scrape, pas
+                  d'écriture). Utile pour vérifier que les credentials Sheets
+                  + le mapping de colonnes fonctionnent.
+    """
+    task_name = "audit_clients_doctolib"
+    if tasks_status[task_name]["running"]:
+        return jsonify({
+            "status": "already_running",
+            "message": "Un audit clients Doctolib est déjà en cours",
+            "started_at": tasks_status[task_name]["last_run"],
+        }), 409
+
+    dry_run = request.args.get("dry_run", "false").lower() == "true"
+
+    from audit_clients_doctolib import run_audit
+    run_sync_in_thread(run_audit, task_name, dry_run=dry_run)
+
+    return jsonify({
+        "status": "started",
+        "task": task_name,
+        "mode": "dry_run" if dry_run else "live",
+        "started_at": tasks_status[task_name]["last_run"],
+        "poll": "/status",
+    }), 202
+
+
 @app.route("/status", methods=["GET"])
 def status():
     """État de toutes les tâches."""
@@ -501,6 +541,8 @@ def index():
             "/trigger/sellsy-retry-failed?tab=Fauteuils_Vides_2026-04-28&prefix=connect:&min_slots=5&days=7": "Params sellsy-retry-failed",
             "/trigger/sellsy-create-from-gsheet": "POST/GET — Crée les opps Sellsy à partir du GSheet (filtre min_slots + dedupe pipeline)",
             "/trigger/sellsy-create-from-gsheet?tab=Fauteuils_Vides_2026-04-28&min_slots=5&pipeline=100281&step=774686": "Params sellsy-create-from-gsheet",
+            "/trigger/audit-clients-doctolib": "POST/GET — 📊 Audit hebdo clients existants : slots Doctolib + reco budget Ads (UP/HOLD/DOWN/PAUSE) sur Sheet 'Cron dépenses vs dispo clients'",
+            "/trigger/audit-clients-doctolib?dry_run=true": "Params audit-clients-doctolib (dry_run = lecture seule)",
             "/rotation-state": "GET — État de rotation des villes",
             "/status": "GET — État des tâches",
             "/health": "GET — Health check",
