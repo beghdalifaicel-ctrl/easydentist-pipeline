@@ -428,6 +428,157 @@ def run(tag_names, min_slots=5, days=7):
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# CREATE OPPS FROM GSHEET : lit l'onglet, dedupe vs pipeline, crée le delta
+# ────────────────────────────────────────────────────────────────────────────
+
+def _list_pipeline_company_ids(sellsy, pipeline_id):
+    """Retourne set des company_id ayant DEJA une opp dans pipeline `pipeline_id`,
+    toutes étapes confondues. Utilise les méthodes de SellsySync."""
+    sellsy._ensure_token()
+    seen = set()
+    offset = 0
+    while True:
+        try:
+            r = sellsy.session.get(
+                f"{SELLSY_API_URL}/opportunities?limit=100&offset={offset}",
+                headers=sellsy.headers, timeout=30)
+            if r.status_code != 200:
+                log.warning(f"list opps HTTP{r.status_code}: {r.text[:200]}")
+                break
+            data = (r.json().get("data") or [])
+            if not data: break
+            for o in data:
+                if (o.get("pipeline") or {}).get("id") != pipeline_id:
+                    continue
+                for rel in (o.get("related") or []):
+                    if rel.get("type") == "company" and rel.get("id"):
+                        seen.add(int(rel["id"]))
+            if len(data) < 100: break
+            offset += 100
+        except Exception as e:
+            log.warning(f"list opps exception: {e}")
+            break
+    return seen
+
+
+def _create_opp(sellsy, sid, name, doctolib_url, nb_creneaux,
+                pipeline_id, step_id, probability, closing_date):
+    sellsy._ensure_token()
+    note = f"Fauteuils vides Doctolib = {nb_creneaux} créneaux/7j (avril 26)."
+    if doctolib_url:
+        note += f" {doctolib_url}"
+    body = {
+        "name": f"Doctolib - {name}"[:120],
+        "pipeline": pipeline_id,
+        "step": step_id,
+        "probability": probability,
+        "estimated_closing_date": closing_date,
+        "related": [{"type":"company","id":int(sid)}],
+        "note": note,
+    }
+    try:
+        r = sellsy.session.post(f"{SELLSY_API_URL}/opportunities",
+                                headers=sellsy.headers, json=body, timeout=30)
+        if r.status_code in (200, 201):
+            d = r.json()
+            return {"ok": True,
+                    "opp_id": d.get("id") or (d.get("data") or {}).get("id"),
+                    "opp_ref": d.get("reference") or (d.get("data") or {}).get("reference")}
+        return {"ok": False, "status": r.status_code, "body": r.text[:300]}
+    except Exception as e:
+        return {"ok": False, "status": "exception", "body": str(e)}
+
+
+def run_create_opps_from_gsheet(tab_name=None, min_slots=5,
+                                pipeline_id=100281, step_id=774686,
+                                probability=30, closing_date="2026-05-29"):
+    """Lit l'onglet, filtre nb_creneaux >= min_slots, dédupe contre les opps existantes
+    du pipeline `pipeline_id`, crée le delta sur step `step_id`."""
+    started = datetime.now(timezone.utc).isoformat()
+
+    sheet = _gsheet_open()
+    if sheet is None:
+        return {"error":"no_gsheet_creds","started_at":started}
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not tab_name:
+        tab_name = f"Fauteuils_Vides_{today}"
+
+    try:
+        ws = sheet.worksheet(tab_name)
+    except Exception as e:
+        return {"error":"tab_not_found","tab":tab_name,"detail":str(e),"started_at":started}
+
+    rows = ws.get_all_values()
+    if not rows or len(rows) < 2:
+        return {"error":"empty_tab","tab":tab_name,"started_at":started}
+
+    headers = rows[0]
+    try:
+        i_id = headers.index("sellsy_id")
+        i_nom = headers.index("nom")
+        i_url = headers.index("doctolib_url")
+        i_nb = headers.index("nb_creneaux")
+    except ValueError as e:
+        return {"error":"missing_headers","headers":headers,"detail":str(e),"started_at":started}
+
+    qualified = []
+    for r in rows[1:]:
+        try:
+            nb = int((r[i_nb] or "0").strip())
+            if nb < min_slots: continue
+            sid = int(r[i_id])
+            qualified.append({
+                "sellsy_id": sid,
+                "nom": (r[i_nom] or "").strip(),
+                "doctolib_url": (r[i_url] or "").strip(),
+                "nb_creneaux": nb,
+            })
+        except (ValueError, IndexError):
+            continue
+
+    log.info(f"=== Create opps from GSheet : tab={tab_name} qualifiés≥{min_slots}={len(qualified)} ===")
+
+    sellsy = SellsySync()
+    log.info("→ Listing opps existantes dans pipeline " + str(pipeline_id))
+    existing = _list_pipeline_company_ids(sellsy, pipeline_id)
+    log.info(f"  → {len(existing)} companies déjà avec une opp dans le pipeline")
+
+    delta = [q for q in qualified if q["sellsy_id"] not in existing]
+    skipped = [q for q in qualified if q["sellsy_id"] in existing]
+    log.info(f"  → delta={len(delta)} | skipped={len(skipped)}")
+
+    results = {"ok": [], "errs": [], "skipped": skipped}
+    for i, q in enumerate(delta, 1):
+        r = _create_opp(sellsy, q["sellsy_id"], q["nom"], q["doctolib_url"],
+                        q["nb_creneaux"], pipeline_id, step_id, probability, closing_date)
+        if r.get("ok"):
+            results["ok"].append({**q, "opp_ref": r.get("opp_ref"), "opp_id": r.get("opp_id")})
+            log.info(f"  [{i}/{len(delta)}] {q['sellsy_id']} {q['nom'][:40]} → {r.get('opp_ref')}")
+        else:
+            results["errs"].append({**q, **r})
+            log.warning(f"  [{i}/{len(delta)}] {q['sellsy_id']} ERR {r.get('status')} {str(r.get('body'))[:120]}")
+        time.sleep(0.25)
+
+    return {
+        "started_at": started,
+        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "create_opps_from_gsheet_v1",
+        "tab": tab_name,
+        "pipeline_id": pipeline_id, "step_id": step_id,
+        "min_slots": min_slots,
+        "qualified_count": len(qualified),
+        "existing_in_pipeline": len(existing),
+        "skipped_count": len(skipped),
+        "delta_count": len(delta),
+        "created_count": len(results["ok"]),
+        "error_count": len(results["errs"]),
+        "created_sample": results["ok"][:10],
+        "errors_sample": results["errs"][:10],
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # RETRY MODE : relit un onglet existant et rejoue les lignes en erreur
 # ────────────────────────────────────────────────────────────────────────────
 
