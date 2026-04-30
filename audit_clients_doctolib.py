@@ -1,13 +1,20 @@
 """
 audit_clients_doctolib.py — Audit hebdomadaire dispo Doctolib des clients Easydentist.
 
+V3.1 — Fix Cloudflare 403 (navigate to booking URL before XHR fetch).
+       Le cf_clearance Doctolib est path-bound : un fetch XHR vers /booking/<slug>.json
+       depuis la homepage seule était rejeté en 403. On navigue à la page de booking
+       réelle d'abord (CF clear le challenge JS, cookies + Referer corrects), puis
+       fetch JSON depuis le même contexte.
+
 V3 — API JSON Doctolib directe (fini le scraping click-by-click) :
   1. Parse l'URL Doctolib pour extraire slug + IDs (placeId, practitionerId, motiveIds)
-  2. Bootstrap session via Bright Data Browser (cookies Doctolib)
-  3. Si motive_ids manquants → fetch /booking/{slug}.json pour avoir agenda_ids + motive_ids
-  4. Fetch /availabilities.json?practitioner_ids[]=X&motive_ids[]=Y&start_date=Z&limit=14
-  5. Score = slots 7j × 2 + slots 8-14j × 1 → reco UP/HOLD/DOWN/PAUSE
-  6. Output : onglet Audit_YYYY-MM-DD + colonne historique sur le sheet principal
+  2. Bootstrap session via Bright Data Browser (cookies Doctolib homepage)
+  3. PER URL: navigate to booking page (établit cf_clearance + cookies booking-specific)
+  4. Si motive_ids manquants → fetch /booking/{slug}.json pour avoir agenda_ids + motive_ids
+  5. Fetch /availabilities.json?practitioner_ids[]=X&motive_ids[]=Y&start_date=Z&limit=14
+  6. Score = slots 7j × 2 + slots 8-14j × 1 → reco UP/HOLD/DOWN/PAUSE
+  7. Output : onglet Audit_YYYY-MM-DD + colonne historique sur le sheet principal
 
 Source sheet : "Cron dépenses vs dispo clients" (env AUDIT_CLIENTS_SHEET_ID).
 """
@@ -40,6 +47,7 @@ GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
 BROWSER_REFRESH_EVERY = int(os.getenv("BROWSER_REFRESH_EVERY", "40"))
 PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "30000"))
+CF_CLEARANCE_WAIT_MS = int(os.getenv("CF_CLEARANCE_WAIT_MS", "3500"))
 
 
 # ─── Google Sheets helpers ──────────────────────────────────────────────────
@@ -186,14 +194,19 @@ def _parse_doctolib_url(url: str) -> dict:
 
 
 async def _fetch_json(page, url: str):
-    """Fetch JSON via the Bright Data browser. Page must be on doctolib.fr first."""
+    """
+    Fetch JSON via the Bright Data browser. Page must be on a doctolib.fr/<booking>
+    URL first (cf_clearance + Referer flow). Adds explicit Referer header for safety
+    in case browser context strips it.
+    """
     try:
         result = await page.evaluate("""async (u) => {
             try {
                 const r = await fetch(u, {
                     headers: {
                         'Accept': 'application/json, text/javascript, */*; q=0.01',
-                        'X-Requested-With': 'XMLHttpRequest'
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Referer': location.href
                     },
                     credentials: 'include'
                 });
@@ -210,7 +223,7 @@ async def _fetch_json(page, url: str):
 
 
 async def _bootstrap_session(page) -> bool:
-    """Navigate to doctolib homepage to set up cookies."""
+    """Navigate to doctolib homepage to set up baseline cookies + JS context."""
     try:
         await page.goto("https://www.doctolib.fr/", wait_until="domcontentloaded",
                         timeout=PAGE_TIMEOUT_MS)
@@ -231,11 +244,21 @@ async def _scrape_one(page, url: str):
     """
     Fetch availabilities via Doctolib's JSON API.
     Returns: (slots_7j, slots_8_14j, next_rdv_iso, status, mode)
+
+    V3.1 fix: navigate to actual booking URL FIRST. The cf_clearance cookie is
+    path-bound, so XHR to /booking/<slug>.json from homepage alone gets 403.
     """
     parsed = _parse_doctolib_url(url)
     slug = parsed["slug"]
     if not slug:
         return 0, 0, None, "no_slug", "url_unparseable"
+
+    # ─── Navigate to booking page → CF challenge resolved + cookies + Referer set ───
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        await page.wait_for_timeout(CF_CLEARANCE_WAIT_MS)
+    except Exception as e:
+        return 0, 0, None, "navigate_fail", f"{type(e).__name__}:{str(e)[:60]}"
 
     motive_ids = list(parsed["motive_ids"])
     practitioner_id = parsed["practitioner_id"]
@@ -476,7 +499,7 @@ def _write_history_column(ws_main, results, today_str):
 # ─── Entry point ───────────────────────────────────────────────────────────
 def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     started = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== audit_clients_doctolib v3 (API JSON) start (dry_run={dry_run}) ===")
+    log.info(f"=== audit_clients_doctolib v3.1 (API JSON + CF fix) start (dry_run={dry_run}) ===")
 
     sheet = _gsheet_open()
     if sheet is None:
@@ -517,7 +540,7 @@ def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     return {
         "started_at": started,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-        "version": "v3_api_json",
+        "version": "v3.1_api_json_cf_fix",
         "clients_count": len(clients),
         "scraped": len(results),
         "audit_tab": audit_tab,
