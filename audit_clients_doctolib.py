@@ -1,12 +1,17 @@
 """
 audit_clients_doctolib.py — Audit hebdomadaire dispo Doctolib des clients Easydentist.
 
-V3.2 — DOM scraping via Bright Data Browser (Playwright CDP).
-       Le V3.1 essayait fetch JSON XHR (/booking/<slug>.json) mais Cloudflare niveau 2
-       bloquait systématiquement (config_fail/http_403). Le V3.2 abandonne le JSON et
-       parse directement le DOM rendu de la page de booking après navigation + clicks
-       à travers le funnel motif/place. Le Bright Data Browser bypass Cloudflare niveau 1
-       (validé en MCP). On lit les boutons de slot dans le DOM et on agrège par date.
+V3.3 — DOM scraping via Bright Data Browser (Playwright CDP) — FIX COOKIES + SLOT REGEX.
+       2 bugs identifiés en V3.2 (validés par debug live BD MCP):
+         1. Le bandeau didomi (cookies) intercepte TOUS les clicks subséquents.
+            → Fix: wait_for_selector('#didomi-notice-agree-button', 5s) + click + wait disappear.
+         2. Les boutons slot ont aria-label = "HH:MM" seul (ex "12:10"), pas "HH:MM le date".
+            La date est dans un button voisin "Masquer/Afficher Lundi 5 mai 2026".
+            → Fix: regex r"^\d{1,2}:\d{2}$" sur aria-label, puis walk-up DOM pour trouver
+              le button de date associé.
+
+V3.2 — DOM scraping via Bright Data Browser (abandonné).
+V3.1 — fetch JSON XHR (bloqué par Cloudflare niveau 2).
 
 Flow :
   1. Navigate to booking URL (auto-bypass CF level 1 via BD Browser)
@@ -64,6 +69,8 @@ NO_BOOKING_KEYWORDS = [
 SKIP_BUTTON_KEYWORDS = [
     "accepter", "refuser", "en savoir plus", "se connecter", "menu",
     "fermer", "retour", "étape précédente", "rechercher", "passer cette étape",
+    "afficher", "masquer", "voir plus de dates", "voir moins",  # actions intra-slots
+    "centre d'aide", "gérer mes rdv", "vous êtes soignant",      # nav header
 ]
 FR_MONTHS = {
     "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
@@ -188,15 +195,36 @@ def _parse_doctolib_url(url: str) -> dict:
 
 # ─── DOM scraping helpers (V3.2) ────────────────────────────────────────────
 async def _accept_cookies(page):
-    """Accepte le bandeau cookies didomi si présent (silencieux si absent)."""
+    """
+    Accepte le bandeau cookies didomi.
+    CRITIQUE: didomi intercepte tous les clicks suivants tant qu'il est ouvert.
+    On wait_for_selector au lieu de query_selector (didomi load async ~1-3s post-DOM).
+    """
     try:
-        btn = await page.query_selector('#didomi-notice-agree-button')
+        btn = await page.wait_for_selector('#didomi-notice-agree-button', timeout=5000, state='visible')
         if btn:
             await btn.click()
-            await page.wait_for_timeout(800)
+            # Wait for banner to actually disappear before any subsequent click
+            try:
+                await page.wait_for_selector('#didomi-host', state='hidden', timeout=3000)
+            except Exception:
+                await page.wait_for_timeout(1500)
             return True
     except Exception:
-        pass
+        # Banner might not appear (already accepted) — try alternate selectors as fallback
+        for sel in [
+            'button[aria-describedby="didomi-notice-data-processing"]',
+            '.didomi-continue-without-agreeing',
+            'button[id*="didomi"][id*="agree"]',
+        ]:
+            try:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click()
+                    await page.wait_for_timeout(1000)
+                    return True
+            except Exception:
+                continue
     return False
 
 
@@ -232,10 +260,54 @@ def _parse_french_date(text: str):
     return None
 
 
+async def _expand_all_days(page):
+    """
+    Click tous les buttons "Afficher Lundi 5 mai 2026" pour révéler les slots
+    masqués des jours collapsed. Limite à 14 jours pour éviter de cliquer "Voir
+    plus de dates" et exploser le DOM.
+    """
+    try:
+        all_buttons = await page.query_selector_all('button[aria-label]')
+    except Exception:
+        return
+    today = datetime.now(timezone.utc).date()
+    for btn in all_buttons:
+        try:
+            aria = await btn.get_attribute('aria-label') or ''
+            m = re.match(r'^Afficher\s+\w+\s+(\d{1,2})\s+(\w+)\s+(\d{4})', aria, re.I)
+            if not m:
+                continue
+            d = int(m.group(1))
+            mo = FR_MONTHS.get(m.group(2).lower())
+            y = int(m.group(3))
+            if not mo:
+                continue
+            try:
+                day = datetime(y, mo, d).date()
+            except ValueError:
+                continue
+            delta = (day - today).days
+            if 0 <= delta <= 14:
+                try:
+                    await btn.click()
+                    await page.wait_for_timeout(300)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+
 async def _count_slots(page) -> dict:
     """
-    Cherche les boutons de slot horaire dans le DOM, parse leurs aria-labels
-    (ou textes parents) pour extraire la date, et bucket par 7j / 8-14j.
+    V3.3: Doctolib pattern réel:
+      - Slot button : aria-label = "12:10" (juste HH:MM)
+      - Date est dans un button voisin "Masquer/Afficher Lundi 5 mai 2026"
+        au sein d'une section/article englobant les slots de ce jour.
+    Algorithme:
+      1. Expand tous les jours dans la fenêtre 14j (click "Afficher [date]")
+      2. Pour chaque button avec aria-label HH:MM, walk-up DOM pour trouver
+         le button frère/parent contenant "Masquer/Afficher [date]"
+      3. Parse la date FR, bucket 7j / 8-14j
     """
     today = datetime.now(timezone.utc).date()
     s7 = 0
@@ -243,55 +315,55 @@ async def _count_slots(page) -> dict:
     next_iso = None
     found_any = False
 
-    # Sélecteurs ordonnés par spécificité — Doctolib utilise différents patterns
-    selectors = [
-        'button[data-test-id^="slot-"]',
-        'button[data-test*="slot"]',
-        'button[data-test*="availability"]',
-        'a[data-test-id^="slot-"]',
-        'button[aria-label*=":"][aria-label*="20"]',  # heure + année
-    ]
+    # 1. Expand collapsed days in 14d window
+    await _expand_all_days(page)
 
-    seen_aria = set()
-    for sel in selectors:
+    # 2. Find slot buttons (aria-label = "HH:MM")
+    try:
+        all_buttons = await page.query_selector_all('button[aria-label]')
+    except Exception:
+        return {"found": False, "s7": 0, "s14": 0, "next_iso": None}
+
+    SLOT_RE = re.compile(r'^\s*\d{1,2}:\d{2}\s*$')
+    DAY_HEADER_RE = re.compile(r'^(Afficher|Masquer)\s+\w+\s+\d{1,2}\s+\w+\s+\d{4}', re.I)
+
+    for btn in all_buttons:
         try:
-            els = await page.query_selector_all(sel)
+            aria = (await btn.get_attribute('aria-label')) or ''
+            if not SLOT_RE.match(aria):
+                continue
+            found_any = True
+
+            # Walk up DOM to find the day-header button (Afficher/Masquer X)
+            day_label = await btn.evaluate("""(el) => {
+                let cur = el;
+                while (cur) {
+                    const parent = cur.parentElement;
+                    if (!parent) return null;
+                    // Look at all buttons within this parent (sibling level + up)
+                    const headers = parent.querySelectorAll('button[aria-label]');
+                    for (const h of headers) {
+                        const a = h.getAttribute('aria-label') || '';
+                        if (/^(Afficher|Masquer)\\s/i.test(a)) return a;
+                    }
+                    cur = parent;
+                }
+                return null;
+            }""")
+
+            day = _parse_french_date(day_label or '')
+            if day is None:
+                continue
+            delta = (day - today).days
+            if 0 <= delta <= 7:
+                s7 += 1
+            elif 8 <= delta <= 14:
+                s14 += 1
+            if next_iso is None or day.isoformat() < next_iso:
+                if delta >= 0:
+                    next_iso = day.isoformat()
         except Exception:
             continue
-        for el in els:
-            try:
-                aria = (await el.get_attribute("aria-label")) or ""
-                if not aria or aria in seen_aria:
-                    continue
-                seen_aria.add(aria)
-                # Extract date — d'abord depuis l'aria, sinon depuis le parent (heading de jour)
-                day = _parse_french_date(aria)
-                if day is None:
-                    # Try parent's aria-label or text
-                    try:
-                        parent = await el.evaluate_handle("el => el.closest('[data-test-id*=\"day\"], [data-test-id*=\"date\"], section, article')")
-                        if parent:
-                            ptext = await parent.evaluate("el => el.getAttribute('aria-label') || el.getAttribute('data-test-id') || el.innerText.slice(0, 80)")
-                            day = _parse_french_date(ptext or "")
-                    except Exception:
-                        pass
-                if day is None:
-                    # Fallback: si on n'a pas la date mais le bouton existe, on compte au moins 1 slot dispo
-                    found_any = True
-                    continue
-                found_any = True
-                delta = (day - today).days
-                if 0 <= delta <= 7:
-                    s7 += 1
-                elif 8 <= delta <= 14:
-                    s14 += 1
-                if next_iso is None or day.isoformat() < next_iso:
-                    if delta >= 0:
-                        next_iso = day.isoformat()
-            except Exception:
-                continue
-        if found_any:
-            break  # Sélecteur trouvé, ne pas itérer sur les suivants
 
     return {"found": found_any, "s7": s7, "s14": s14, "next_iso": next_iso}
 
@@ -525,7 +597,7 @@ def _write_history_column(ws_main, results, today_str):
 # ─── Entry point ───────────────────────────────────────────────────────────
 def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     started = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== audit_clients_doctolib v3.2 (DOM scraping) start (dry_run={dry_run}) ===")
+    log.info(f"=== audit_clients_doctolib v3.3 (DOM scraping + cookies fix) start (dry_run={dry_run}) ===")
 
     sheet = _gsheet_open()
     if sheet is None:
@@ -566,7 +638,7 @@ def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     return {
         "started_at": started,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-        "version": "v3.2_dom_scraping",
+        "version": "v3.3_dom_scraping_cookies_fix",
         "clients_count": len(clients),
         "scraped": len(results),
         "audit_tab": audit_tab,
