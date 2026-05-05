@@ -1,20 +1,22 @@
 """
 audit_clients_doctolib.py — Audit hebdomadaire dispo Doctolib des clients Easydentist.
 
-V3.1 — Fix Cloudflare 403 (navigate to booking URL before XHR fetch).
-       Le cf_clearance Doctolib est path-bound : un fetch XHR vers /booking/<slug>.json
-       depuis la homepage seule était rejeté en 403. On navigue à la page de booking
-       réelle d'abord (CF clear le challenge JS, cookies + Referer corrects), puis
-       fetch JSON depuis le même contexte.
+V3.2 — DOM scraping via Bright Data Browser (Playwright CDP).
+       Le V3.1 essayait fetch JSON XHR (/booking/<slug>.json) mais Cloudflare niveau 2
+       bloquait systématiquement (config_fail/http_403). Le V3.2 abandonne le JSON et
+       parse directement le DOM rendu de la page de booking après navigation + clicks
+       à travers le funnel motif/place. Le Bright Data Browser bypass Cloudflare niveau 1
+       (validé en MCP). On lit les boutons de slot dans le DOM et on agrège par date.
 
-V3 — API JSON Doctolib directe (fini le scraping click-by-click) :
-  1. Parse l'URL Doctolib pour extraire slug + IDs (placeId, practitionerId, motiveIds)
-  2. Bootstrap session via Bright Data Browser (cookies Doctolib homepage)
-  3. PER URL: navigate to booking page (établit cf_clearance + cookies booking-specific)
-  4. Si motive_ids manquants → fetch /booking/{slug}.json pour avoir agenda_ids + motive_ids
-  5. Fetch /availabilities.json?practitioner_ids[]=X&motive_ids[]=Y&start_date=Z&limit=14
-  6. Score = slots 7j × 2 + slots 8-14j × 1 → reco UP/HOLD/DOWN/PAUSE
-  7. Output : onglet Audit_YYYY-MM-DD + colonne historique sur le sheet principal
+Flow :
+  1. Navigate to booking URL (auto-bypass CF level 1 via BD Browser)
+  2. Auto-accept cookie consent (didomi)
+  3. Loop max N steps :
+     - Detect page state (not_bookable / slots / picker)
+     - If slots → parse aria-labels, count by date bucket (7j / 8-14j)
+     - If picker (motif ou place) → click first valid option, wait, retry
+     - If not_bookable → return 0
+  4. Output : onglet Audit_YYYY-MM-DD + colonne historique sur le sheet principal.
 
 Source sheet : "Cron dépenses vs dispo clients" (env AUDIT_CLIENTS_SHEET_ID).
 """
@@ -46,8 +48,28 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
 BROWSER_REFRESH_EVERY = int(os.getenv("BROWSER_REFRESH_EVERY", "40"))
-PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "30000"))
-CF_CLEARANCE_WAIT_MS = int(os.getenv("CF_CLEARANCE_WAIT_MS", "3500"))
+PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "45000"))
+SPA_INITIAL_WAIT_MS = int(os.getenv("SPA_INITIAL_WAIT_MS", "4000"))
+SPA_TRANSITION_WAIT_MS = int(os.getenv("SPA_TRANSITION_WAIT_MS", "2500"))
+MAX_FUNNEL_STEPS = int(os.getenv("MAX_FUNNEL_STEPS", "4"))
+
+NO_BOOKING_KEYWORDS = [
+    "n'est pas réservable",
+    "pas réservable en ligne",
+    "pas de disponibilités",
+    "aucune disponibilité",
+    "indisponible",
+    "ne peut pas prendre rendez-vous",
+]
+SKIP_BUTTON_KEYWORDS = [
+    "accepter", "refuser", "en savoir plus", "se connecter", "menu",
+    "fermer", "retour", "étape précédente", "rechercher", "passer cette étape",
+]
+FR_MONTHS = {
+    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5,
+    "juin": 6, "juillet": 7, "août": 8, "aout": 8, "septembre": 9,
+    "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
+}
 
 
 # ─── Google Sheets helpers ──────────────────────────────────────────────────
@@ -153,85 +175,164 @@ def compute_reco(slots_7j, slots_8_14j, next_rdv_days, budget):
             "budget_recommande": new_b, "color": "ORANGE"}
 
 
-# ─── Doctolib API helpers ───────────────────────────────────────────────────
+# ─── URL parsing (toujours utile pour le log) ───────────────────────────────
 def _parse_doctolib_url(url: str) -> dict:
-    """Extract slug + IDs from any Doctolib booking URL."""
     parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
     path = parsed.path
     if "/booking" in path:
         slug = path.split("/booking", 1)[0].lstrip("/")
     else:
         slug = path.lstrip("/").rstrip("/")
-
-    def _ids(key):
-        # Doctolib accepts both `key[]=` and `key=` for arrays
-        out = []
-        for k in (f"{key}[]", key):
-            for v in qs.get(k, []):
-                try:
-                    out.append(int(v))
-                except (ValueError, TypeError):
-                    pass
-        return out
-
-    practitioner_id = None
-    pid_raw = (qs.get("practitionerId") or qs.get("practitioner_id") or [None])[0]
-    if pid_raw:
-        try:
-            practitioner_id = int(pid_raw)
-        except (ValueError, TypeError):
-            pass
-
-    return {
-        "slug": slug,
-        "place_id": (qs.get("placeId") or qs.get("place_id") or [None])[0],
-        "practitioner_id": practitioner_id,
-        "motive_ids": _ids("motiveIds") + _ids("motive_ids"),
-        "motive_category_ids": _ids("motiveCategoryIds") + _ids("motive_category_ids"),
-        "speciality_id": (qs.get("specialityId") or qs.get("speciality_id") or [None])[0],
-    }
+    return {"slug": slug}
 
 
-async def _fetch_json(page, url: str):
-    """
-    Fetch JSON via the Bright Data browser. Page must be on a doctolib.fr/<booking>
-    URL first (cf_clearance + Referer flow). Adds explicit Referer header for safety
-    in case browser context strips it.
-    """
+# ─── DOM scraping helpers (V3.2) ────────────────────────────────────────────
+async def _accept_cookies(page):
+    """Accepte le bandeau cookies didomi si présent (silencieux si absent)."""
     try:
-        result = await page.evaluate("""async (u) => {
-            try {
-                const r = await fetch(u, {
-                    headers: {
-                        'Accept': 'application/json, text/javascript, */*; q=0.01',
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'Referer': location.href
-                    },
-                    credentials: 'include'
-                });
-                const status = r.status;
-                if (!r.ok) return {__error: 'http_' + status};
-                const text = await r.text();
-                try { return JSON.parse(text); }
-                catch(e) { return {__error: 'parse_fail', __body: text.slice(0, 200)}; }
-            } catch(e) { return {__error: 'fetch_fail', __detail: String(e)}; }
-        }""", url)
-        return result if isinstance(result, dict) else {"__error": "non_dict"}
-    except Exception as e:
-        return {"__error": "evaluate_fail", "__detail": str(e)[:80]}
+        btn = await page.query_selector('#didomi-notice-agree-button')
+        if btn:
+            await btn.click()
+            await page.wait_for_timeout(800)
+            return True
+    except Exception:
+        pass
+    return False
 
 
-async def _bootstrap_session(page) -> bool:
-    """Navigate to doctolib homepage to set up baseline cookies + JS context."""
+async def _detect_no_booking(page) -> bool:
+    """Renvoie True si la page indique 'pas réservable / pas de dispo'."""
     try:
-        await page.goto("https://www.doctolib.fr/", wait_until="domcontentloaded",
-                        timeout=PAGE_TIMEOUT_MS)
-        await page.wait_for_timeout(2500)
-        return True
-    except Exception as e:
-        log.warning(f"Bootstrap fail: {e}")
+        body_text = (await page.inner_text("body")).lower()
+    except Exception:
         return False
+    return any(kw in body_text for kw in NO_BOOKING_KEYWORDS)
+
+
+def _parse_french_date(text: str):
+    """Extrait une date d'un texte type 'lundi 5 mai 2026' ou '2026-05-05'."""
+    if not text:
+        return None
+    iso_m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+    if iso_m:
+        try:
+            return datetime.strptime(iso_m.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    fr_m = re.search(r"(\d{1,2})\s+([a-zéûâïôê]+)\s+(\d{4})", text.lower())
+    if fr_m:
+        try:
+            d = int(fr_m.group(1))
+            mo = FR_MONTHS.get(fr_m.group(2))
+            y = int(fr_m.group(3))
+            if mo:
+                return datetime(y, mo, d).date()
+        except (ValueError, KeyError):
+            pass
+    return None
+
+
+async def _count_slots(page) -> dict:
+    """
+    Cherche les boutons de slot horaire dans le DOM, parse leurs aria-labels
+    (ou textes parents) pour extraire la date, et bucket par 7j / 8-14j.
+    """
+    today = datetime.now(timezone.utc).date()
+    s7 = 0
+    s14 = 0
+    next_iso = None
+    found_any = False
+
+    # Sélecteurs ordonnés par spécificité — Doctolib utilise différents patterns
+    selectors = [
+        'button[data-test-id^="slot-"]',
+        'button[data-test*="slot"]',
+        'button[data-test*="availability"]',
+        'a[data-test-id^="slot-"]',
+        'button[aria-label*=":"][aria-label*="20"]',  # heure + année
+    ]
+
+    seen_aria = set()
+    for sel in selectors:
+        try:
+            els = await page.query_selector_all(sel)
+        except Exception:
+            continue
+        for el in els:
+            try:
+                aria = (await el.get_attribute("aria-label")) or ""
+                if not aria or aria in seen_aria:
+                    continue
+                seen_aria.add(aria)
+                # Extract date — d'abord depuis l'aria, sinon depuis le parent (heading de jour)
+                day = _parse_french_date(aria)
+                if day is None:
+                    # Try parent's aria-label or text
+                    try:
+                        parent = await el.evaluate_handle("el => el.closest('[data-test-id*=\"day\"], [data-test-id*=\"date\"], section, article')")
+                        if parent:
+                            ptext = await parent.evaluate("el => el.getAttribute('aria-label') || el.getAttribute('data-test-id') || el.innerText.slice(0, 80)")
+                            day = _parse_french_date(ptext or "")
+                    except Exception:
+                        pass
+                if day is None:
+                    # Fallback: si on n'a pas la date mais le bouton existe, on compte au moins 1 slot dispo
+                    found_any = True
+                    continue
+                found_any = True
+                delta = (day - today).days
+                if 0 <= delta <= 7:
+                    s7 += 1
+                elif 8 <= delta <= 14:
+                    s14 += 1
+                if next_iso is None or day.isoformat() < next_iso:
+                    if delta >= 0:
+                        next_iso = day.isoformat()
+            except Exception:
+                continue
+        if found_any:
+            break  # Sélecteur trouvé, ne pas itérer sur les suivants
+
+    return {"found": found_any, "s7": s7, "s14": s14, "next_iso": next_iso}
+
+
+async def _click_first_picker_option(page) -> bool:
+    """
+    Détecte un picker (motif/place) et clique la 1ʳᵉ option valide pour avancer.
+    Retourne True si un click a été effectué.
+    """
+    selectors = [
+        # Doctolib React design system cards (cliquables)
+        '[data-design-system-component="Card"]:not([aria-disabled="true"])',
+        'button[data-design-system-component="Button"][aria-label*="motif"]',
+        'button.dl-card-content:not([disabled])',
+        'a.dl-card:not([aria-disabled="true"])',
+        'div[data-test*="motive"] button',
+        'div[data-test*="place"] button',
+        # Fallback: bouton dans main avec texte > 5 chars (skip nav)
+        'main button:not([disabled])',
+        'main a[role="button"]',
+    ]
+    for sel in selectors:
+        try:
+            els = await page.query_selector_all(sel)
+        except Exception:
+            continue
+        for el in els:
+            try:
+                if not await el.is_visible():
+                    continue
+                txt = ((await el.inner_text()) or "").strip()
+                low = txt.lower()
+                if len(txt) < 3 or len(txt) > 200:
+                    continue
+                if any(s in low for s in SKIP_BUTTON_KEYWORDS):
+                    continue
+                await el.click()
+                return True
+            except Exception:
+                continue
+    return False
 
 
 async def _new_browser_page(pw):
@@ -242,122 +343,50 @@ async def _new_browser_page(pw):
 
 async def _scrape_one(page, url: str):
     """
-    Fetch availabilities via Doctolib's JSON API.
+    V3.2 DOM scraping.
     Returns: (slots_7j, slots_8_14j, next_rdv_iso, status, mode)
-
-    V3.1 fix: navigate to actual booking URL FIRST. The cf_clearance cookie is
-    path-bound, so XHR to /booking/<slug>.json from homepage alone gets 403.
     """
     parsed = _parse_doctolib_url(url)
-    slug = parsed["slug"]
-    if not slug:
+    if not parsed["slug"]:
         return 0, 0, None, "no_slug", "url_unparseable"
 
-    # ─── Navigate to booking page → CF challenge resolved + cookies + Referer set ───
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-        await page.wait_for_timeout(CF_CLEARANCE_WAIT_MS)
+        await page.wait_for_timeout(SPA_INITIAL_WAIT_MS)
     except Exception as e:
         return 0, 0, None, "navigate_fail", f"{type(e).__name__}:{str(e)[:60]}"
 
-    motive_ids = list(parsed["motive_ids"])
-    practitioner_id = parsed["practitioner_id"]
-    agenda_ids = []
-    visit_motives_lookup = {}  # id -> name, for picking right motives
+    # Cookies (silencieux si pas de bandeau)
+    await _accept_cookies(page)
 
-    # Step 1: get booking config
-    config_url = f"https://www.doctolib.fr/booking/{slug}.json"
-    cfg = await _fetch_json(page, config_url)
-    if "__error" in cfg:
-        return 0, 0, None, "config_fail", cfg.get("__error", "?")
+    # Loop : détecter état et avancer
+    last_step_status = "unknown"
+    for step in range(MAX_FUNNEL_STEPS):
+        # 1) Page indique "non réservable" ?
+        if await _detect_no_booking(page):
+            return 0, 0, None, "ok", f"not_bookable_step_{step}"
 
-    try:
-        data = cfg.get("data") or {}
-        agendas = data.get("agendas") or []
-        if not agendas:
-            return 0, 0, None, "no_agenda", "config_empty"
+        # 2) On voit des slots ?
+        slots = await _count_slots(page)
+        if slots["found"]:
+            return slots["s7"], slots["s14"], slots["next_iso"], "ok", f"slots_step_{step}_total={slots['s7']+slots['s14']}"
 
-        # Match agenda(s) to practitioner_id if specified, else take all
-        for a in agendas:
-            aid = a.get("id")
-            apid = a.get("practitioner_id")
-            if practitioner_id and apid != practitioner_id:
-                continue
-            if aid:
-                agenda_ids.append(aid)
-            if not practitioner_id and apid:
-                practitioner_id = apid
+        # 3) Sinon on est sur un picker → click 1ʳᵉ option
+        clicked = await _click_first_picker_option(page)
+        if not clicked:
+            last_step_status = f"no_clickable_step_{step}"
+            break
+        await page.wait_for_timeout(SPA_TRANSITION_WAIT_MS)
+        last_step_status = f"clicked_step_{step}"
 
-        if not agenda_ids:
-            # Fallback: take all agendas
-            agenda_ids = [a.get("id") for a in agendas if a.get("id")]
+    # Re-vérif après dernier click
+    if await _detect_no_booking(page):
+        return 0, 0, None, "ok", f"not_bookable_after_{last_step_status}"
+    slots = await _count_slots(page)
+    if slots["found"]:
+        return slots["s7"], slots["s14"], slots["next_iso"], "ok", f"slots_after_{last_step_status}"
 
-        # Build motive lookup
-        for vm in (data.get("visit_motives") or []):
-            mid = vm.get("id")
-            if mid:
-                visit_motives_lookup[mid] = (vm.get("name") or "").lower()
-
-        # If we don't have motive_ids from URL, pick "consultation/première"
-        if not motive_ids:
-            re_consult = re.compile(r"consultation|premi[èe]re|soins|d[ée]tartrage|examen|nouveau patient|nouvelle patient", re.I)
-            for mid, name in visit_motives_lookup.items():
-                if re_consult.search(name):
-                    motive_ids.append(mid)
-            # Fallback to first 3 if nothing matched
-            if not motive_ids and visit_motives_lookup:
-                motive_ids = list(visit_motives_lookup.keys())[:3]
-
-    except Exception as e:
-        return 0, 0, None, "config_parse_fail", f"{type(e).__name__}:{str(e)[:60]}"
-
-    if not motive_ids:
-        return 0, 0, None, "no_motive_ids", "after_lookup"
-    if not agenda_ids:
-        return 0, 0, None, "no_agenda_ids", "after_lookup"
-
-    # Step 2: fetch availabilities
-    today = datetime.now(timezone.utc).date()
-    params = [f"start_date={today.strftime('%Y-%m-%d')}", "limit=14"]
-    for mid in motive_ids[:5]:
-        params.append(f"motive_ids[]={mid}")
-    for aid in agenda_ids[:5]:
-        params.append(f"agenda_ids[]={aid}")
-    if practitioner_id:
-        params.append(f"practitioner_ids[]={practitioner_id}")
-
-    avail_url = f"https://www.doctolib.fr/availabilities.json?{'&'.join(params)}"
-    avail = await _fetch_json(page, avail_url)
-    if "__error" in avail:
-        return 0, 0, None, "avail_fail", avail.get("__error", "?")
-
-    # Step 3: count slots
-    slots_7j = 0
-    slots_8_14j = 0
-    next_iso = None
-    ns = avail.get("next_slot")
-    if isinstance(ns, str):
-        next_iso = ns[:10]
-
-    for d in (avail.get("availabilities") or []):
-        date_str = (d.get("date") or "")[:10]
-        slots = d.get("slots") or []
-        if not date_str or not slots:
-            continue
-        try:
-            day = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        delta = (day - today).days
-        if 0 <= delta <= 7:
-            slots_7j += len(slots)
-        elif 8 <= delta <= 14:
-            slots_8_14j += len(slots)
-        if not next_iso:
-            next_iso = date_str
-
-    total = avail.get("total", 0)
-    return slots_7j, slots_8_14j, next_iso, "ok", f"api_total={total}_motives={len(motive_ids)}"
+    return 0, 0, None, "no_slots_found", last_step_status
 
 
 # ─── Loop ──────────────────────────────────────────────────────────────────
@@ -374,16 +403,13 @@ async def _scrape_loop(clients, results_acc, stats):
             url = c["doctolib_url"]
             budget = _parse_budget(c["budget_raw"])
 
-            # (Re)connect browser + bootstrap session
+            # (Re)connect browser quand nécessaire
             if browser is None or in_session >= BROWSER_REFRESH_EVERY:
                 if browser is not None:
                     try: await browser.close()
                     except Exception: pass
                 try:
                     browser, page = await _new_browser_page(pw)
-                    ok = await _bootstrap_session(page)
-                    if not ok:
-                        log.warning(f"  [{i}/{n}] bootstrap fail")
                     in_session = 0
                     log.info(f"  [{i}/{n}] browser refreshed")
                 except Exception as e:
@@ -430,7 +456,7 @@ async def _scrape_loop(clients, results_acc, stats):
                 in_session = 0
                 await asyncio.sleep(2)
 
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
 
         if browser is not None:
             try: await browser.close()
@@ -499,7 +525,7 @@ def _write_history_column(ws_main, results, today_str):
 # ─── Entry point ───────────────────────────────────────────────────────────
 def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     started = datetime.now(timezone.utc).isoformat()
-    log.info(f"=== audit_clients_doctolib v3.1 (API JSON + CF fix) start (dry_run={dry_run}) ===")
+    log.info(f"=== audit_clients_doctolib v3.2 (DOM scraping) start (dry_run={dry_run}) ===")
 
     sheet = _gsheet_open()
     if sheet is None:
@@ -540,7 +566,7 @@ def run_audit(min_slots: int = 5, days: int = 14, dry_run: bool = False):
     return {
         "started_at": started,
         "ended_at": datetime.now(timezone.utc).isoformat(),
-        "version": "v3.1_api_json_cf_fix",
+        "version": "v3.2_dom_scraping",
         "clients_count": len(clients),
         "scraped": len(results),
         "audit_tab": audit_tab,
