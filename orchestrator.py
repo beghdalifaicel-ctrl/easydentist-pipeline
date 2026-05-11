@@ -502,7 +502,7 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5, specialty: str = "
     else:
         min_slots = int(os.getenv("MIN_SLOTS", "2"))
     with_slots = [d for d in unique if d.get("hasSlotsThisWeek") and d.get("timeSlotCount", 0) > min_slots]
-    log.info(f"📊 {city} ({specialty}): {len(unique)} praticiens uniques, {len(with_slots)} avec >{MIN_SLOTS} créneaux (7j glissants)")
+    log.info(f"📊 {city} ({specialty}): {len(unique)} praticiens uniques, {len(with_slots)} avec >{min_slots} créneaux (7j glissants)")
 
     return with_slots
 
