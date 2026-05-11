@@ -49,7 +49,7 @@ def run_async_in_thread(coro_func, task_name, **kwargs):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             result = loop.run_until_complete(coro_func(**kwargs))
-            tasks_status[task_name]["last_result"] = {"status": "success", "detail": str(result)}
+            tasks_status[task_name]["last_result"] = {"status": "success", "detail": result if isinstance(result, (dict, list)) else (str(result) if result is not None else None)}
             logger.info(f"[{task_name}] Terminé avec succès")
         except Exception as e:
             tb = traceback.format_exc()
