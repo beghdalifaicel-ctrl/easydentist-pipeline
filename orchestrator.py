@@ -48,6 +48,17 @@ BYPASS_MOTIF_FILTER_SPECIALTIES = {
     "chirurgien-esthetique",
 }
 
+# Spécialités qui utilisent l'API /search Doctolib (React SPA, JSON-LD blob)
+# au lieu du legacy pattern /{specialty}/{city} (qui ne marche pas pour les esthé/dermato).
+SPECIALTIES_USING_SEARCH_API = {
+    "medecin-esthetique",
+    "chirurgien-esthetique-et-plasticien",
+    "chirurgien-plasticien",
+    "chirurgien-esthetique",
+    "dermatologue-et-venerologue",
+    "dermatologue",
+}
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 # Bright Data Browser API
@@ -250,6 +261,60 @@ JS_EXTRACT_DENTISTS = """
 }
 """
 
+JS_EXTRACT_FROM_JSONLD = """
+() => {
+    // Parse le JSON-LD blob (présent sur les pages /search Doctolib React SPA)
+    const ld = document.querySelector('script[data-id="removable-json-ld"]');
+    if (!ld) return [];
+    let data;
+    try { data = JSON.parse(ld.textContent); } catch (e) { return []; }
+    const items = (data.mainEntity && data.mainEntity.itemListElement) || [];
+
+    // Récupère les slots du DOM (pas dans JSON-LD), indexés par href profil
+    const slotsByHref = new Map();
+    const cards = document.querySelectorAll('[data-test-id="hcp-results"] .dl-card.dl-card-variant-default');
+    cards.forEach(card => {
+        const a = card.querySelector('a[href*="?pid="]');
+        if (!a) return;
+        const href = a.getAttribute('href').split('?')[0];
+        const slots = Array.from(card.querySelectorAll('button[data-test-id="slot-button"] .dl-button-label'))
+            .map(s => (s.textContent || '').trim());
+        slotsByHref.set(href, slots);
+    });
+
+    return items.map(it => {
+        const item = it.item || {};
+        const url = item.url || '';
+        let href = url;
+        try {
+            if (url.startsWith('http')) href = new URL(url).pathname;
+            else href = url.split('?')[0];
+        } catch (e) { href = url.split('?')[0]; }
+
+        const slots = slotsByHref.get(href) || [];
+        const hasSlots = slots.length > 0;
+
+        const addr = item.address || {};
+        const city = addr.addressLocality || '';
+        const street = addr.streetAddress || '';
+        const zip = addr.postalCode || '';
+        const address = (street + ' ' + zip + ' ' + city).trim();
+
+        return {
+            name: item.name || '',
+            href: href,
+            address: address,
+            city: city,
+            phone: '',
+            prochainRdv: null,
+            timeSlotCount: slots.length,
+            hasSlotsThisWeek: hasSlots,
+            rawText: ((item.medicalSpecialty || '') + ' | ' + slots.join(',')).substring(0, 500)
+        };
+    });
+}
+"""
+
 JS_CHECK_IS_ON_DOCTOLIB = """
 () => {
     const body = document.body.innerText || '';
@@ -340,7 +405,10 @@ async def _scrape_pages(browser, url_base: str, city: str, max_pages: int, date_
             await asyncio.sleep(1)
 
             # Extraire les praticiens (selector adapté à la spécialité)
-            page_dentists = await page.evaluate(JS_EXTRACT_DENTISTS, specialty)
+            if specialty in SPECIALTIES_USING_SEARCH_API:
+                page_dentists = await page.evaluate(JS_EXTRACT_FROM_JSONLD)
+            else:
+                page_dentists = await page.evaluate(JS_EXTRACT_DENTISTS, specialty)
             log.info(f"    → {len(page_dentists)} {specialty} trouvés")
 
             for d in page_dentists:
@@ -373,20 +441,28 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5, specialty: str = "
         return []
 
     city_slug = city.lower().replace(' ', '-').replace("'", "-")
-    url_base = f"https://www.doctolib.fr/{specialty}/{city_slug}"
 
-    # Calculer les deux fenêtres de dates pour couvrir 7 jours glissants
-    today = datetime.now()
-    today_str = today.strftime("%Y-%m-%d")
-    # Doctolib affiche ~5-6 jours par vue. On calcule le début de la 2ème fenêtre
-    # pour couvrir les jours restants de la semaine prochaine.
-    # Ex: jeudi 9 → fenêtre 1: jeu-dim (4j), fenêtre 2: lun 13 → mer 15 (3j)
-    days_until_monday = (7 - today.weekday()) % 7
-    if days_until_monday == 0:
-        days_until_monday = 7  # Si on est lundi, la 2ème fenêtre = lundi prochain
-    next_window_date = (today + timedelta(days=days_until_monday)).strftime("%Y-%m-%d")
+    # Bascule selon la spécialité : /search?keyword= pour les esthé/dermato (React SPA),
+    # legacy /{specialty}/{city} pour dentistes/radiologues.
+    if specialty in SPECIALTIES_USING_SEARCH_API:
+        # API /search : un seul URL, le param availabilitiesBefore=7 filtre déjà sur 7 jours
+        url_base = f"https://www.doctolib.fr/search?keyword={specialty}&location={city_slug}&availabilitiesBefore=7"
+        windows = [(url_base, "search-7j")]
+    else:
+        url_legacy = f"https://www.doctolib.fr/{specialty}/{city_slug}"
+        # Calculer les deux fenêtres de dates pour couvrir 7 jours glissants
+        today = datetime.now()
+        today_str = today.strftime("%Y-%m-%d")
+        days_until_monday = (7 - today.weekday()) % 7
+        if days_until_monday == 0:
+            days_until_monday = 7
+        next_window_date = (today + timedelta(days=days_until_monday)).strftime("%Y-%m-%d")
+        windows = [
+            (f"{url_legacy}?availability_date={today_str}", f"semaine1({today_str})"),
+            (f"{url_legacy}?availability_date={next_window_date}", f"semaine2({next_window_date})"),
+        ]
 
-    log.info(f"🔍 Scraping Doctolib: {city} (max {max_pages} pages, 7j glissants: {today_str} → +7j)")
+    log.info(f"🔍 Scraping Doctolib: {city} ({specialty}, max {max_pages} pages × {len(windows)} fenêtres)")
 
     all_dentists = []
 
@@ -398,15 +474,9 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5, specialty: str = "
             return []
 
         try:
-            # Fenêtre 1: cette semaine (vue par défaut, depuis aujourd'hui)
-            url_w1 = f"{url_base}?availability_date={today_str}"
-            w1_dentists = await _scrape_pages(browser, url_w1, city, max_pages, f"semaine1({today_str})", specialty=specialty)
-            all_dentists.extend(w1_dentists)
-
-            # Fenêtre 2: début semaine prochaine (pour couvrir les jours restants)
-            url_w2 = f"{url_base}?availability_date={next_window_date}"
-            w2_dentists = await _scrape_pages(browser, url_w2, city, max_pages, f"semaine2({next_window_date})", specialty=specialty)
-            all_dentists.extend(w2_dentists)
+            for url_w, label in windows:
+                w_dentists = await _scrape_pages(browser, url_w, city, max_pages, label, specialty=specialty)
+                all_dentists.extend(w_dentists)
         finally:
             await browser.close()
 
@@ -426,8 +496,12 @@ async def scrape_doctolib_city(city: str, max_pages: int = 5, specialty: str = "
     unique = list(merged.values())
 
     # Filtrer: garder seulement ceux avec plus de 5 créneaux sur les 7 prochains jours
-    MIN_SLOTS = int(os.getenv("MIN_SLOTS", "2"))
-    with_slots = [d for d in unique if d.get("hasSlotsThisWeek") and d.get("timeSlotCount", 0) > MIN_SLOTS]
+    # Pour les spés /search (esthé/dermato), on baisse le seuil car il y a souvent 1-2 slots / 7j
+    if specialty in SPECIALTIES_USING_SEARCH_API:
+        min_slots = int(os.getenv("MIN_SLOTS_SEARCH", "0"))
+    else:
+        min_slots = int(os.getenv("MIN_SLOTS", "2"))
+    with_slots = [d for d in unique if d.get("hasSlotsThisWeek") and d.get("timeSlotCount", 0) > min_slots]
     log.info(f"📊 {city} ({specialty}): {len(unique)} praticiens uniques, {len(with_slots)} avec >{MIN_SLOTS} créneaux (7j glissants)")
 
     return with_slots
