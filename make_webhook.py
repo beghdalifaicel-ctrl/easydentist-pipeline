@@ -122,7 +122,19 @@ def trigger_enrich():
     }), 200
 
 
-ALLOWED_SPECIALTIES = {"dentiste", "chirurgien-dentiste", "medecin-esthetique", "radiologue"}
+ALLOWED_SPECIALTIES = {
+    "dentiste",
+    "chirurgien-dentiste",
+    "medecin-esthetique",
+    "chirurgien-esthetique-et-plasticien",
+    "chirurgien-plasticien",
+    "chirurgien-esthetique",
+    "dermatologue-et-venerologue",
+    "dermatologue",
+    "radiologue",  # legacy — ne pas utiliser via la tâche esthétique
+}
+
+ALLOWED_MOTIF_FILTERS = {"", "esthetique"}
 
 
 @app.route("/trigger/orchestrator", methods=["POST", "GET"])
@@ -140,12 +152,20 @@ def trigger_orchestrator():
     max_pages = int(request.args.get("max_pages", 5))
     dry_run = request.args.get("dry_run", "false").lower() == "true"
     specialty = request.args.get("specialty", "dentiste").strip().lower()
+    motif_filter = request.args.get("motif_filter", "").strip().lower()
 
     # Validation: la spécialité doit correspondre exactement à un slug Doctolib connu
     if specialty not in ALLOWED_SPECIALTIES:
         return jsonify({
             "status": "error",
             "message": f"specialty invalide: '{specialty}'. Valeurs acceptées: {sorted(ALLOWED_SPECIALTIES)}",
+        }), 400
+
+    # Validation: motif_filter doit être vide ou "esthetique"
+    if motif_filter not in ALLOWED_MOTIF_FILTERS:
+        return jsonify({
+            "status": "error",
+            "message": f"motif_filter invalide: '{motif_filter}'. Valeurs acceptées: {sorted(ALLOWED_MOTIF_FILTERS)}",
         }), 400
 
     from orchestrator import run as orchestrator_run
@@ -158,11 +178,12 @@ def trigger_orchestrator():
         dry_run=dry_run,
         output_dir=".",
         specialty=specialty,
+        motif_filter=(motif_filter or None),
     )
 
     return jsonify({
         "status": "started",
-        "message": f"Orchestrateur lancé (city={city}, specialty={specialty}, max_pages={max_pages}, dry_run={dry_run})",
+        "message": f"Orchestrateur lancé (city={city}, specialty={specialty}, motif_filter={motif_filter or None}, max_pages={max_pages}, dry_run={dry_run})",
         "timestamp": datetime.now().isoformat(),
     }), 200
 

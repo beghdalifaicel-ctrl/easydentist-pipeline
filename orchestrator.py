@@ -27,6 +27,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ─── Filtre actes esthétiques (regex sur les motifs Doctolib) ────────────────
+# Utilisé quand motif_filter='esthetique' est passé à run().
+# Bypass automatique pour les spécialités déjà 100% esthétiques.
+ESTHETIC_MOTIF_REGEX = re.compile(
+    r"injection|botox|toxine botulique|acide hyaluronique|hyaluronique|comblement"
+    r"|m[ée]soth[ée]rapie|skinbooster|prp|plasma riche"
+    r"|[ée]pilation laser|laser alexandrite|laser nd[: ]?yag|laser diode|ipl|lumi[èe]re puls[ée]e"
+    r"|laser co2|laser vasculaire|laser pigmentaire|d[ée]tatouage|photo[- ]?rajeunissement|photomodulation"
+    r"|peeling|radiofr[ée]quence|hifu|cryolipolyse|microneedling|dermapen"
+    r"|m[ée]decine esth[ée]tique|m[ée]decine anti[- ]?[âa]ge|rajeunissement",
+    re.IGNORECASE,
+)
+
+# Spécialités pour lesquelles on bypass le filtre actes (présumées 100% esthétiques)
+BYPASS_MOTIF_FILTER_SPECIALTIES = {
+    "medecin-esthetique",
+    "chirurgien-esthetique-et-plasticien",
+    "chirurgien-plasticien",
+    "chirurgien-esthetique",
+}
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 # Bright Data Browser API
@@ -1253,7 +1274,7 @@ def phone_matches(phone: str, contact: dict) -> bool:
 # RAPPORT JSON
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_report(decisions: list[dict], city: str, specialty: str = "dentiste") -> dict:
+def generate_report(decisions: list[dict], city: str, specialty: str = "dentiste", motif_filtered_count: int = 0) -> dict:
     """Génère le rapport JSON final."""
     now = datetime.now()
     p1 = [d for d in decisions if d.get("priority") == 1]
@@ -1268,6 +1289,7 @@ def generate_report(decisions: list[dict], city: str, specialty: str = "dentiste
             "city": city,
             "specialty": specialty,
             "total_scraped": len(decisions),
+            "motif_filtered_count": motif_filtered_count,
             "priority_1_count": len(p1),
             "priority_2_count": len(p2),
             "skipped_count": len(skipped),
@@ -1429,10 +1451,109 @@ def update_google_sheet(decisions: list[dict]):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# FILTRE ACTES ESTHÉTIQUES (motifs Doctolib)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_doctolib_motifs(client: httpx.AsyncClient, href: str) -> list[str]:
+    """Récupère la liste des motifs de consultation depuis l'endpoint JSON interne Doctolib.
+
+    Tente d'abord /booking/{slug}.json. Si ça échoue, retourne une liste vide
+    (le filtre traitera un retour vide comme "non-matching" — donc exclu).
+    """
+    if not href:
+        return []
+    slug = href.rstrip("/").split("/")[-1]
+    url = f"https://www.doctolib.fr/booking/{slug}.json"
+    try:
+        r = await client.get(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            },
+            timeout=15.0,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+    except Exception as e:
+        log.debug(f"motifs fetch err {slug}: {e}")
+        return []
+
+    # Plusieurs schémas Doctolib possibles — on agrège tout ce qui ressemble à un nom de motif
+    motifs: list[str] = []
+    def _walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in ("name", "label", "title", "motif_name", "visit_motive_name") and isinstance(v, str):
+                    motifs.append(v)
+                else:
+                    _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+    _walk(data.get("data", data))
+    return motifs
+
+
+async def filter_by_esthetic_motifs(
+    dentists: list[dict],
+    specialty: str,
+    motif_filter: str | None,
+) -> tuple[list[dict], int]:
+    """Filtre la liste des praticiens par actes esthétiques.
+
+    - Si motif_filter != 'esthetique' → no-op (retourne la liste telle quelle).
+    - Si specialty est dans BYPASS_MOTIF_FILTER_SPECIALTIES → no-op.
+    - Sinon (ex: dermatologue) → ne garde que les praticiens dont au moins un motif
+      Doctolib matche ESTHETIC_MOTIF_REGEX. Si le fetch échoue, le praticien
+      est EXCLU (conservatif côté ciblage).
+
+    Retourne (liste filtrée, nombre filtrés).
+    """
+    if motif_filter != "esthetique":
+        return dentists, 0
+    if specialty in BYPASS_MOTIF_FILTER_SPECIALTIES:
+        log.info(f"  ⏩ Filtre actes esthétiques bypassé pour spécialité {specialty}")
+        return dentists, 0
+    if not dentists:
+        return dentists, 0
+
+    log.info(f"🔬 Filtre actes esthétiques sur {len(dentists)} praticiens (spé={specialty})...")
+    kept: list[dict] = []
+    filtered_out = 0
+
+    # Pool httpx + sémaphore pour limiter la concurrence à 5
+    sem = asyncio.Semaphore(5)
+    async with httpx.AsyncClient() as client:
+        async def _check(d):
+            nonlocal filtered_out
+            async with sem:
+                motifs = await fetch_doctolib_motifs(client, d.get("href", ""))
+                # Sauvegarder les motifs trouvés sur le dict (utile pour debug/report)
+                d["doctolib_motifs"] = motifs[:20]  # cap à 20 pour pas gonfler le JSON
+                joined = " | ".join(motifs)
+                if motifs and ESTHETIC_MOTIF_REGEX.search(joined):
+                    return ("keep", d)
+                return ("filter", d)
+
+        results = await asyncio.gather(*[_check(d) for d in dentists])
+
+    for verdict, d in results:
+        if verdict == "keep":
+            kept.append(d)
+        else:
+            filtered_out += 1
+
+    log.info(f"  → {len(kept)} gardés, {filtered_out} filtrés (sans motif esthétique)")
+    return kept, filtered_out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: str = ".", global_seen_urls: set | None = None, specialty: str = "dentiste"):
+async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: str = ".", global_seen_urls: set | None = None, specialty: str = "dentiste", motif_filter: str | None = None):
     """Exécute le pipeline complet pour une ville et une spécialité Doctolib donnée."""
     log.info(f"═══════════════════════════════════════════")
     log.info(f"  ORCHESTRATEUR EASYDENTIST — {city.upper()} ({specialty})")
@@ -1452,6 +1573,17 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
     log.info(f"ÉTAPE 1b : Vérification profils Doctolib")
     log.info(f"{'='*50}")
     dentists = await check_doctolib_profiles(dentists)
+
+    # 1c. Filtre actes esthétiques (no-op si motif_filter=None ou spé déjà esthé)
+    motif_filtered_count = 0
+    if motif_filter:
+        log.info(f"\n{'='*50}")
+        log.info(f"ÉTAPE 1c : Filtre actes esthétiques (motif_filter={motif_filter})")
+        log.info(f"{'='*50}")
+        dentists, motif_filtered_count = await filter_by_esthetic_motifs(dentists, specialty, motif_filter)
+        if not dentists:
+            log.warning(f"Aucun praticien restant après filtre actes esthétiques à {city}")
+            return
 
     log.info(f"\n{'='*50}")
     log.info(f"ÉTAPE 2-3 : Qualification Sellsy + Ringover")
@@ -1504,7 +1636,7 @@ async def run(city: str, max_pages: int = 5, dry_run: bool = False, output_dir: 
         await asyncio.sleep(0.3)
 
     # 4. Rapport
-    report = generate_report(decisions, city, specialty=specialty)
+    report = generate_report(decisions, city, specialty=specialty, motif_filtered_count=motif_filtered_count)
 
     # Sauvegarder
     date_str = datetime.now().strftime("%Y-%m-%d")
